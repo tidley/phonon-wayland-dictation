@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "phonon-wayland-dictation"
+version = "0.1.0"
+description = "Offline push-to-talk dictation using a local Phonon-2 server on Linux Wayland"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["evdev>=1.7"]
+
+[project.scripts]
+phonon-dictate = "phonon_dictation.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
