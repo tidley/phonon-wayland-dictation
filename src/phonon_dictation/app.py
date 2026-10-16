@@ -13,6 +13,7 @@ import sys
 import subprocess
 import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from evdev import InputDevice, ecodes, list_devices
@@ -24,6 +25,37 @@ KEYCODES = {
     "normal": ["29:1", "47:1", "47:0", "29:0"],
     "terminal": ["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"],
 }
+
+
+@dataclass
+class KeyboardState:
+    """Track modifier state across all monitored physical keyboards."""
+
+    shift_devices: set[str] = field(default_factory=set)
+    recording: bool = False
+    terminal_requested: bool = False
+
+    def handle(self, device_path: str, event) -> str | None:
+        if event.type != ecodes.EV_KEY:
+            return None
+        if event.code == KEY_SHIFT and event.value in (0, 1):
+            if event.value:
+                self.shift_devices.add(device_path)
+                if self.recording:
+                    self.terminal_requested = True
+            else:
+                self.shift_devices.discard(device_path)
+            return None
+        if event.code != KEY_TALK:
+            return None
+        if event.value == 1 and not self.recording:
+            self.recording = True
+            self.terminal_requested = bool(self.shift_devices)
+            return "start"
+        if event.value == 0 and self.recording:
+            self.recording = False
+            return "stop"
+        return None
 
 
 def parser():
@@ -63,7 +95,9 @@ def open_keyboards():
             # Ignore synthetic keyboard to avoid feeding back injected shortcuts.
             name = dev.name.lower()
             caps = dev.capabilities().get(ecodes.EV_KEY, [])
-            if KEY_TALK in caps and not any(x in name for x in ("ydotool", "virtual", "uinput")):
+            if (KEY_TALK in caps or KEY_SHIFT in caps) and not any(
+                x in name for x in ("ydotool", "virtual", "uinput")
+            ):
                 devices.append(dev)
                 print(f"Monitoring: {dev.name} ({path})", flush=True)
             else:
@@ -103,7 +137,10 @@ def ensure_server(args):
         if local_fermion.is_file():
             command[0] = str(local_fermion)
     print("Starting local Phonon-2 server...", flush=True)
-    process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+    try:
+        process = subprocess.Popen(command, stdin=subprocess.DEVNULL)
+    except OSError as exc:
+        raise SystemExit(f"Could not start Phonon server ({command[0]}): {exc}") from exc
     for _ in range(120):  # up to 60 seconds for cold start
         if process.poll() is not None:
             raise SystemExit(f"Phonon server exited with code {process.returncode}")
@@ -111,12 +148,25 @@ def ensure_server(args):
             print("Phonon server ready", flush=True)
             return process
         time.sleep(0.5)
-    process.terminate()
+    stop_process(process, signal.SIGTERM)
+    raise SystemExit("Phonon server failed to become ready within 60 seconds")
+
+
+def stop_process(process: subprocess.Popen, stop_signal: int = signal.SIGINT):
+    """Stop a child without leaving a recorder or owned server behind."""
+    if process.poll() is not None:
+        return
     try:
+        process.send_signal(stop_signal)
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         process.kill()
-    raise SystemExit("Phonon server failed to become ready within 60 seconds")
+        process.wait()
+
+
+def remove_recording(path: Path | None):
+    if path is not None:
+        path.unlink(missing_ok=True)
 
 
 def main():
@@ -130,8 +180,7 @@ def main():
     server_proc = None
     recording = None
     recording_path = None
-    shift_held = False
-    terminal_requested = False
+    keyboard_state = KeyboardState()
     server_proc = ensure_server(args)
     print("Ready. Right Ctrl = normal paste; Right Ctrl + Right Shift = terminal paste.", flush=True)
 
@@ -140,31 +189,27 @@ def main():
             readable, _, _ = select.select(devices, [], [])
             for dev in readable:
                 for event in dev.read():
-                    if event.type != ecodes.EV_KEY:
-                        continue
-                    if event.code == KEY_SHIFT and event.value in (0, 1):
-                        shift_held = event.value == 1
-                        if shift_held and recording is not None:
-                            terminal_requested = True
-                    elif event.code == KEY_TALK and event.value == 1 and recording is None:
-                        terminal_requested = shift_held
+                    action = keyboard_state.handle(dev.path, event)
+                    if action == "start":
                         with tempfile.NamedTemporaryFile(suffix=".wav", prefix="phonon-dictation-", delete=False) as f:
                             recording_path = Path(f.name)
-                        recording = subprocess.Popen(
-                            ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "pulse", "-i", args.source,
-                             "-ac", "1", "-ar", "16000", str(recording_path)],
-                            stdin=subprocess.DEVNULL,
-                        )
-                        print("Recording...", flush=True)
-                    elif event.code == KEY_TALK and event.value == 0 and recording is not None:
-                        recording.send_signal(signal.SIGINT)
                         try:
-                            recording.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            recording.kill()
-                            recording.wait()
+                            recording = subprocess.Popen(
+                                ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "pulse", "-i", args.source,
+                                 "-ac", "1", "-ar", "16000", str(recording_path)],
+                                stdin=subprocess.DEVNULL,
+                            )
+                        except OSError as exc:
+                            keyboard_state.recording = False
+                            remove_recording(recording_path)
+                            recording_path = None
+                            print(f"Could not start microphone recording: {exc}", flush=True)
+                            continue
+                        print("Recording...", flush=True)
+                    elif action == "stop" and recording is not None:
+                        stop_process(recording)
                         recording = None
-                        selected_mode = "terminal" if terminal_requested else args.mode
+                        selected_mode = "terminal" if keyboard_state.terminal_requested else args.mode
                         print(f"Paste mode: {selected_mode}", flush=True)
                         try:
                             if recording_path.stat().st_size < 1000:
@@ -177,28 +222,19 @@ def main():
                         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
                             print(f"Dictation error: {exc}", flush=True)
                         finally:
-                            recording_path.unlink(missing_ok=True)
+                            remove_recording(recording_path)
                             recording_path = None
     except KeyboardInterrupt:
         print("\nStopped.", flush=True)
     finally:
         if recording is not None:
-            recording.send_signal(signal.SIGINT)
-            try:
-                recording.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                recording.kill()
-                recording.wait()
+            stop_process(recording)
         if recording_path is not None:
-            recording_path.unlink(missing_ok=True)
+            remove_recording(recording_path)
         for dev in devices:
             dev.close()
         if server_proc is not None and server_proc.poll() is None:
-            server_proc.terminate()
-            try:
-                server_proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                server_proc.kill()
+            stop_process(server_proc, signal.SIGTERM)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,10 @@ description = "Offline push-to-talk dictation using a local Phonon-2 server on L
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-dependencies = ["evdev>=1.7"]
+dependencies = ["evdev>=1.7", "fermion-research>=0.2.11"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
 
 [project.scripts]
 phonon-dictate = "phonon_dictation.app:main"
