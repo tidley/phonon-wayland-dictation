@@ -12,6 +12,7 @@ The model is downloaded once from its upstream source. After that download, audi
 - PipeWire/PulseAudio capture through FFmpeg, clipboard insertion through `wl-copy`, and input through `ydotool`.
 - Optional systemd user service for graphical-login startup.
 - Temporary WAV recordings are deleted after each attempt, including transcription failures.
+- Keyboard hotplug, dock reconnection, and suspend/resume recovery without reloading Phonon-2.
 
 ## Support
 
@@ -53,7 +54,7 @@ sudo usermod -aG input "$USER"
 
 Then fully log out and log in before running the application or its user service. A long-lived systemd user manager does not inherit a newly added supplementary group. Do not add `SupplementaryGroups=input` to the user service: user services cannot perform that group transition and systemd reports `status=216/GROUP`.
 
-Membership in `input` permits programs in your account to read raw input events, including passwords and other sensitive keyboard input. It is broad access, not an application-specific permission. The application filters out `ydotool`, `uinput`, and virtual keyboards to avoid feeding its synthetic paste shortcut back into dictation.
+Membership in `input` permits programs in your account to read raw input events, including passwords and other sensitive keyboard input. It is broad access, not an application-specific permission. The application requires read access, never changes device permissions, and excludes devices whose names contain `ydotool` (including the default `ydotoold virtual device`) to avoid feedback. Keep that identifying name if configuring ydotoold. Other virtual keyboards, including `solaar-keyboard`, are supported when their evdev capabilities include Right Ctrl. Right Shift is optional and enables terminal mode when present.
 
 For a more restricted deployment, use a locally reviewed udev/logind policy that grants the active local seat user access only to physical devices marked `ID_INPUT_KEYBOARD=1`. That policy must cover newly enumerated event devices and should be tested after reconnecting keyboards. It requires administrator review because any process running as the logged-in user can still read those keyboard events. A temporary `setfacl` grant can diagnose a session that has not been logged out, but is intentionally not installed or persisted by this project.
 
@@ -77,6 +78,16 @@ systemctl --user enable --now ydotool.service
 | Release Right Ctrl after selecting terminal mode | Transcribe the complete recording and paste with Ctrl+Shift+V. |
 
 The trigger keys remain visible to the focused application. Pressing Right Shift after recording starts is supported. Repeated key events do not start a second recorder.
+
+### Keyboard Lifecycle And Recovery
+
+Input devices are discovered at startup and registered dynamically using `pyudev` and a selector. A five-second reconciliation scan also catches missed notifications, recreated event nodes, and devices that become readable after a permission/ACL change. No fixed event numbers are configured. When no usable keyboards are connected, the application waits and resumes monitoring when one appears; the speech server stays loaded.
+
+Shift state is tracked per keyboard. Shift held before Ctrl, or pressed during a recording, selects terminal paste even if Shift is released first. Mirrored physical/Solaar events are merged by timestamp and repeated Ctrl presses are coalesced. The first Ctrl release ends the recording, including a release routed through another keyboard; remaining mirrored releases do not submit it again. Release held trigger keys before starting another recording or after reconnecting a keyboard.
+
+Removing a monitored keyboard during recording conservatively cancels that recording, clears that device's modifier state, stops FFmpeg, and deletes the WAV without transcription or paste. Lost evdev events (`SYN_DROPPED`) and stale-device read errors also trigger safe recovery. On resume, the application detects elapsed suspend time using Linux's suspend-inclusive clock, cancels interrupted capture, clears modifiers, and reopens input handles even when event paths have not changed. No logind D-Bus dependency or systemd restart hook is needed. Resume checks occur at least once per second while the input loop is idle. A recording interrupted by resume is discarded, including when resume is detected before/during transcription.
+
+Transcription and paste remain synchronous: input notifications are serviced after those operations finish (the transcription request has a 120-second timeout). Resume is checked before submitting audio and again before pasting its result. Keyboard rediscovery itself never starts or stops the model server.
 
 Useful options:
 
@@ -111,6 +122,8 @@ The service starts at graphical login, starts or reuses the local server, and ra
 ./install.sh --autostart --force-service
 ```
 
+Lifecycle logs report device names/paths, inaccessible devices, waiting/restored monitoring, and recording cancellations. Permission errors are retried without repeatedly logging the same failure. The dictation client does not log raw key events, microphone audio, or transcription text; it logs only transcription completion. An independently configured transcription server may have its own logging policy.
+
 Manage it with:
 
 ```bash
@@ -137,6 +150,13 @@ journalctl --user -u phonon-dictation.service -f
 2. Hold Right Ctrl, press Right Shift during speech, then release Right Ctrl; confirm Ctrl+Shift+V works in the intended terminal.
 3. Repeat after a fresh graphical login and after reconnecting an external keyboard.
 4. Stop and restart the service; confirm no duplicate `fermion serve` or FFmpeg processes remain.
+5. Connect and disconnect the external keyboard and dock while idle; verify added/removed logs and dictation on both laptop and external keyboards without restarting the service.
+6. Remove all usable keyboards, then reconnect one (including under a different event number); verify waiting/restored logs and normal/terminal paste.
+7. Disconnect a keyboard while holding Right Ctrl; verify capture is cancelled, its temporary WAV is removed, and a fresh press records normally.
+8. Suspend/resume both while idle and while recording. Verify interrupted capture is discarded and new recordings work, including when input event paths remain unchanged.
+9. Repeat with Solaar enabled and confirm one recording/transcription per gesture. Check that the Phonon server PID remains unchanged throughout hotplug and resume tests.
+
+These hardware-specific recovery scenarios must be checked on the target laptop/dock; mocked automated tests do not establish physical suspend or hotplug results.
 
 ## Uninstallation
 
@@ -151,7 +171,7 @@ Remove the project checkout separately if desired. Remove downloaded model data 
 
 ## Contributing
 
-Run the hardware-independent suite with `python -m pytest`. Do not commit recordings, model caches, virtual environments, logs, credentials, machine-specific service files, or other private data. Please include manual test notes for changes affecting audio, keyboard input, Wayland, or terminals.
+Install test dependencies with `.venv/bin/python -m pip install -e '.[test]'`, then run the hardware-independent suite with `PYTHONPATH=src .venv/bin/python -m pytest`. The explicit source path also avoids testing an older non-editable installed copy. Do not commit recordings, model caches, virtual environments, logs, credentials, machine-specific service files, or other private data. Please include manual test notes for changes affecting audio, keyboard input, Wayland, or terminals.
 
 ## License
 
