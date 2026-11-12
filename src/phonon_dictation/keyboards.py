@@ -4,10 +4,20 @@ from __future__ import annotations
 import os
 import selectors
 import time
+from dataclasses import dataclass
 from glob import glob
 
 import pyudev
 from evdev import InputDevice, ecodes
+
+
+@dataclass
+class KeySnapshot:
+    """Ordered state recovery, rather than a synthetic press or release."""
+
+    held: list[int] | None
+    sec: int
+    usec: int
 
 
 def suspend_offset():
@@ -42,6 +52,7 @@ class KeyboardMonitor:
         self.removed = removed
         self.devices = {}
         self.identities = {}
+        self.syncing = set()
         self.inaccessible = set()
         self.available = None
         self.next_scan = 0
@@ -61,6 +72,7 @@ class KeyboardMonitor:
         if dev is None:
             return
         self.identities.pop(path, None)
+        self.syncing.discard(path)
         try:
             self.selector.unregister(dev)
         except (KeyError, ValueError, OSError):
@@ -89,7 +101,8 @@ class KeyboardMonitor:
                 caps = dev.capabilities().get(ecodes.EV_KEY, [])
                 # ydotoold's default uinput name; don't exclude Solaar or
                 # arbitrary legitimate devices just because they're virtual.
-                if ecodes.KEY_RIGHTCTRL not in caps or "ydotool" in dev.name.casefold():
+                modifiers = {ecodes.KEY_RIGHTCTRL, ecodes.KEY_RIGHTSHIFT}
+                if not modifiers.intersection(caps) or "ydotool" in dev.name.casefold():
                     close_device(dev)
                     continue
                 identity = self.identity(os.fstat(dev.fd))
@@ -135,14 +148,38 @@ class KeyboardMonitor:
             if dev is None or self.devices.get(dev.path) is not dev:
                 continue
             try:
-                batch = list(dev.read())
-                if not batch:
-                    self.discard(dev.path)
-                    continue
-                if any(e.type == ecodes.EV_SYN and e.code == ecodes.SYN_DROPPED for e in batch):
-                    self.discard(dev.path, "input events lost")
-                    continue
-                events.extend((dev.path, event) for event in batch)
+                snapshot_at = None
+                while True:
+                    try:
+                        batch = list(dev.read())
+                    except BlockingIOError:
+                        break
+                    if not batch:
+                        self.discard(dev.path)
+                        break
+                    for event in batch:
+                        if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_DROPPED:
+                            if dev.path not in self.syncing:
+                                print(f"Input events lost; recovering: {dev.name} ({dev.path})", flush=True)
+                            self.syncing.add(dev.path)
+                            snapshot_at = None
+                        elif dev.path in self.syncing:
+                            if event.type == ecodes.EV_SYN and event.code == ecodes.SYN_REPORT:
+                                self.syncing.discard(dev.path)
+                                snapshot_at = event
+                        elif snapshot_at is not None:
+                            # active_keys describes the state after all queued
+                            # events, so don't replay these against that state.
+                            snapshot_at = event
+                        else:
+                            events.append((dev.path, event))
+                if snapshot_at is not None and dev.path in self.devices:
+                    try:
+                        held = dev.active_keys()
+                    except OSError as exc:
+                        held = None
+                        print(f"Input state recovery failed: {dev.path} ({exc})", flush=True)
+                    events.append((dev.path, KeySnapshot(held, snapshot_at.sec, snapshot_at.usec)))
             except BlockingIOError:
                 pass
             except OSError:

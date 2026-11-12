@@ -1,5 +1,6 @@
 """Hardware-independent input lifecycle and application recovery tests."""
 import errno
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -33,6 +34,8 @@ class Device:
     def read(self):
         if self.error:
             raise self.error
+        if not self.events:
+            raise BlockingIOError
         events, self.events = self.events, []
         return iter(events)
 
@@ -116,9 +119,9 @@ def test_initial_discovery_identification_and_duplicate_add(rig):
         "synthetic": Device("synthetic", "ydotoold virtual device"),
     })
     rig.monitor.reconcile()
-    assert set(rig.monitor.devices) == {"laptop", "solaar", "ctrl-only"}
+    assert set(rig.monitor.devices) == {"laptop", "solaar", "ctrl-only", "shift-only"}
     assert rig.devices["synthetic"].closed
-    assert rig.devices["shift-only"].closed
+    assert not rig.devices["shift-only"].closed
     notify(rig, "add", "laptop")
     assert rig.opened.count(rig.devices["laptop"]) == 1
     assert not rig.removed
@@ -212,14 +215,134 @@ def test_removal_processed_before_buffered_release(rig):
     assert rig.removed[0][1] is True
 
 
-def test_syn_dropped_cancels_instead_of_transcribing(rig):
+def syn(code, timestamp=0):
+    return SimpleNamespace(type=app.ecodes.EV_SYN, code=code, sec=timestamp, usec=0)
+
+
+@pytest.mark.parametrize("held,expected", [
+    ([app.KEY_TALK], None),
+    ([app.KEY_TALK, app.KEY_SHIFT], None),
+    ([], "cancel"),
+])
+def test_syn_dropped_recovers_at_report_without_disconnect(rig, capsys, held, expected):
     dev = rig.devices["kbd"] = Device("kbd")
     rig.monitor.reconcile()
     rig.state.handle("kbd", key(app.KEY_TALK, 1))
-    dev.events = [SimpleNamespace(type=app.ecodes.EV_SYN, code=app.ecodes.SYN_DROPPED)]
+    dev.events = [syn(app.ecodes.SYN_DROPPED), key(app.KEY_TALK, 0)]
     rig.selector.ready = [dev]
     assert rig.monitor.poll(0) == []
-    assert rig.removed == [("kbd", True, "input events lost")]
+    assert rig.state.recording
+    dev.held = held
+    dev.events = [key(app.KEY_SHIFT, 1), syn(app.ecodes.SYN_REPORT)]
+    rig.selector.ready = [dev]
+    actions = [rig.state.handle(path, event) for path, event in rig.monitor.poll(0)]
+    assert actions == [expected]
+    assert rig.state.recording == (expected is None)
+    assert ("kbd" in rig.state.talk_devices) == (app.KEY_TALK in held)
+    assert ("kbd" in rig.state.shift_devices) == (app.KEY_SHIFT in held)
+    assert not rig.removed
+    assert not dev.closed
+    assert rig.opened == [dev]
+    assert "Input device removed" not in capsys.readouterr().out
+    if expected is None:
+        assert rig.state.handle("kbd", key(app.KEY_TALK, 0)) == "stop"
+
+
+def test_sync_query_failure_cancels_without_closing_device(rig):
+    dev = rig.devices["kbd"] = Device("kbd")
+    rig.monitor.reconcile()
+    rig.state.handle("kbd", key(app.KEY_TALK, 1))
+
+    def failed_query():
+        raise OSError(errno.EIO, "state unavailable")
+
+    dev.active_keys = failed_query
+    dev.events = [syn(app.ecodes.SYN_DROPPED), syn(app.ecodes.SYN_REPORT)]
+    rig.selector.ready = [dev]
+    assert [rig.state.handle(path, event) for path, event in rig.monitor.poll(0)] == ["cancel"]
+    assert not dev.closed
+    assert not rig.removed
+
+
+@pytest.mark.parametrize("other_held", [[], [app.KEY_SHIFT], [app.KEY_TALK]])
+def test_unrelated_device_removal_preserves_active_capture(rig, other_held):
+    rig.devices.update(owner=Device("owner"), other=Device("other"))
+    rig.monitor.reconcile()
+    rig.state.handle("owner", key(app.KEY_TALK, 1))
+    for code in other_held:
+        rig.state.handle("other", key(code, 1))
+    del rig.devices["other"]
+    notify(rig, "remove", "other")
+    assert rig.state.recording
+    assert rig.state.owner == "owner"
+    assert rig.removed[0][1] is False
+    assert rig.state.handle("owner", key(app.KEY_TALK, 0)) == "stop"
+
+
+def test_owner_removal_does_not_transfer_to_mirror(rig):
+    rig.devices.update(owner=Device("owner"), mirror=Device("mirror"))
+    rig.monitor.reconcile()
+    rig.state.handle("owner", key(app.KEY_TALK, 1))
+    rig.state.handle("mirror", key(app.KEY_TALK, 1))
+    del rig.devices["owner"]
+    notify(rig, "remove", "owner")
+    assert rig.removed[0][1] is True
+    assert not rig.state.recording
+    assert rig.state.handle("mirror", key(app.KEY_TALK, 0)) is None
+
+
+def test_drains_multiple_reads_and_uses_current_snapshot(rig):
+    dev = rig.devices["kbd"] = Device("kbd")
+    rig.monitor.reconcile()
+    batches = iter([
+        [key(app.KEY_TALK, 1, 1)],
+        [syn(app.ecodes.SYN_DROPPED, 2)],
+        [key(app.KEY_TALK, 0, 3), syn(app.ecodes.SYN_REPORT, 4)],
+        [key(app.KEY_TALK, 0, 5), syn(app.ecodes.SYN_REPORT, 6)],
+    ])
+
+    def read():
+        try:
+            return iter(next(batches))
+        except StopIteration:
+            raise BlockingIOError
+
+    dev.read = read
+    rig.selector.ready = [dev]
+    actions = [rig.state.handle(path, event) for path, event in rig.monitor.poll(0)]
+    assert actions == ["start", "cancel"]
+    assert not rig.state.recording
+    assert not dev.closed
+
+
+def test_unrelated_sync_recovery_preserves_owner(rig):
+    rig.devices.update(owner=Device("owner"), other=Device("other"))
+    rig.monitor.reconcile()
+    rig.state.handle("owner", key(app.KEY_TALK, 1))
+    other = rig.devices["other"]
+    other.events = [syn(app.ecodes.SYN_DROPPED), syn(app.ecodes.SYN_REPORT)]
+    other.held = [app.KEY_SHIFT]
+    rig.selector.ready = [other]
+    assert [rig.state.handle(path, event) for path, event in rig.monitor.poll(0)] == [None]
+    assert rig.state.recording
+    assert rig.state.terminal_requested
+
+
+def test_thirty_second_hold_with_repeated_sync_recovery(rig, monkeypatch):
+    clock = [0]
+    monkeypatch.setattr(keyboards.time, "monotonic", lambda: clock[0])
+    dev = rig.devices["kbd"] = Device("kbd")
+    rig.monitor.reconcile()
+    assert rig.state.handle("kbd", key(app.KEY_TALK, 1)) == "start"
+    dev.held = [app.KEY_TALK]
+    for second in range(1, 31):
+        clock[0] = second
+        dev.events = [syn(app.ecodes.SYN_DROPPED, second), syn(app.ecodes.SYN_REPORT, second)]
+        rig.selector.ready = [dev]
+        assert [rig.state.handle(path, event) for path, event in rig.monitor.poll(0)] == [None]
+        assert rig.state.recording
+    assert rig.state.handle("kbd", key(app.KEY_TALK, 0, 30)) == "stop"
+    assert not rig.removed
 
 
 def test_bad_descriptor_on_close_does_not_prevent_state_cleanup(rig):
@@ -239,6 +362,7 @@ def test_bad_descriptor_on_close_does_not_prevent_state_cleanup(rig):
 def test_eof_deregisters_instead_of_busy_looping(rig):
     dev = rig.devices["kbd"] = Device("kbd")
     rig.monitor.reconcile()
+    dev.read = lambda: iter([])
     rig.selector.ready = [dev]
     assert rig.monitor.poll(0) == []
     assert dev.closed
@@ -268,10 +392,12 @@ def test_mirrored_modifiers_produce_only_one_start_and_stop():
     assert state.handle("physical", key(app.KEY_TALK, 1)) == "start"
 
 
-def test_release_from_other_keyboard_does_not_leave_trigger_stuck():
+def test_release_from_other_keyboard_does_not_stop_owner():
     state = app.KeyboardState()
     assert state.handle("one", key(app.KEY_TALK, 1)) == "start"
-    assert state.handle("two", key(app.KEY_TALK, 0)) == "stop"
+    assert state.handle("two", key(app.KEY_TALK, 0)) is None
+    assert state.recording
+    assert state.handle("one", key(app.KEY_TALK, 0)) == "stop"
     assert state.handle("one", key(app.KEY_TALK, 1)) == "start"
 
 
@@ -284,7 +410,7 @@ def test_resume_detected_from_suspend_inclusive_clock(monkeypatch):
     assert not watch.resumed()
 
 
-@pytest.mark.parametrize("recovery", ["disconnect", "resume"])
+@pytest.mark.parametrize("recovery", ["disconnect", "resume", "sync-released", "sync-unknown"])
 def test_main_cancels_capture_cleans_file_and_keeps_server(monkeypatch, tmp_path, recovery):
     calls, paths = [], []
     server, recorder = object(), object()
@@ -318,6 +444,9 @@ def test_main_cancels_capture_cleans_file_and_keeps_server(monkeypatch, tmp_path
                 if recovery == "disconnect":
                     self.removed("kbd", "input device disconnected")
                     self.added("new-kbd", [])
+                elif recovery.startswith("sync-"):
+                    held = [] if recovery == "sync-released" else None
+                    return [("kbd", keyboards.KeySnapshot(held, 0, 0))]
                 return []
             assert calls == ["server-start", "record", "record-stop"]
             assert paths and all(not path.exists() for path in paths)
@@ -357,11 +486,25 @@ def test_main_transcription_privacy_and_resume_before_paste(monkeypatch, tmp_pat
 
     def capture(command, **kwargs):
         app.Path(command[-1]).write_bytes(b"x" * 2000)
-        return SimpleNamespace(returncode=255)
+        return SimpleNamespace(returncode=255, poll=lambda: 255, wait=lambda timeout: None)
 
     monkeypatch.setattr(app.subprocess, "Popen", capture)
-    monkeypatch.setattr(app, "transcribe", lambda *args: "private transcription")
-    monkeypatch.setattr(app, "paste", lambda *args: pasted.append(args))
+    finished = threading.Event()
+    offset = [0]
+
+    def transcribe(*args):
+        if suspended:
+            offset[0] = 30
+            finished.set()
+        return "private transcription"
+
+    def paste(*args):
+        pasted.append(args)
+        finished.set()
+
+    monkeypatch.setattr(app, "transcribe", transcribe)
+    monkeypatch.setattr(app, "paste", paste)
+    monkeypatch.setattr(app, "suspend_offset", lambda: offset[0])
 
     class Monitor:
         def __init__(self, added, removed):
@@ -376,6 +519,7 @@ def test_main_transcription_privacy_and_resume_before_paste(monkeypatch, tmp_pat
                 return [("kbd", key(app.KEY_SHIFT, 1)), ("kbd", key(app.KEY_TALK, 1))]
             if self.step == 2:
                 return [("kbd", key(app.KEY_SHIFT, 0)), ("kbd", key(app.KEY_TALK, 0))]
+            assert finished.wait(5)
             raise KeyboardInterrupt
 
         def reset(self, reason):
@@ -386,10 +530,100 @@ def test_main_transcription_privacy_and_resume_before_paste(monkeypatch, tmp_pat
         def close(self):
             pass
 
-    checks = iter([False, False, False, suspended])
     monkeypatch.setattr(app, "KeyboardMonitor", Monitor)
-    monkeypatch.setattr(app, "ResumeWatch", lambda: SimpleNamespace(resumed=lambda: next(checks)))
+    monkeypatch.setattr(app, "ResumeWatch", lambda: SimpleNamespace(resumed=lambda: False))
     app.main()
     assert pasted == ([] if suspended else [("private transcription", "terminal", 0.25)])
     assert "private transcription" not in capsys.readouterr().out
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("blocked_operation", ["transcription", "paste"])
+def test_main_drains_input_and_rapid_cycles_while_worker_is_blocked(monkeypatch, tmp_path, blocked_operation):
+    monkeypatch.setattr(app.sys, "argv", ["phonon-dictate"])
+    monkeypatch.setattr(app.tempfile, "tempdir", str(tmp_path))
+    server = SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(app, "ensure_server", lambda args: server)
+    stopped = []
+    monkeypatch.setattr(app, "stop_process", lambda proc, *args: stopped.append(proc))
+    monkeypatch.setattr(app, "ResumeWatch", lambda: SimpleNamespace(resumed=lambda: False))
+    entered, release, complete = threading.Event(), threading.Event(), threading.Event()
+    captures, pasted = [], []
+    cycles = 25
+
+    class Capture:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def send_signal(self, sig):
+            assert sig == app.signal.SIGINT
+            self.returncode = 255
+
+        def wait(self, timeout):
+            assert self.returncode == 255
+
+    def capture(command, **kwargs):
+        path = app.Path(command[-1])
+        path.write_bytes(b"x" * 2000)
+        captures.append(path)
+        return Capture()
+
+    def transcribe(path, url):
+        assert path.exists()
+        if blocked_operation == "transcription":
+            entered.set()
+            assert release.wait(5)
+        return path.name
+
+    def paste(text, mode, delay):
+        assert mode == "normal"
+        if blocked_operation == "paste":
+            entered.set()
+            assert release.wait(5)
+        pasted.append(text)
+        if len(pasted) == cycles:
+            complete.set()
+
+    monkeypatch.setattr(app.subprocess, "Popen", capture)
+    monkeypatch.setattr(app, "transcribe", transcribe)
+    monkeypatch.setattr(app, "paste", paste)
+
+    class Monitor:
+        def __init__(self, added, removed):
+            self.step = 0
+            self.added, self.removed = added, removed
+
+        def reconcile(self):
+            self.added("physical", [])
+            self.added("mirror", [])
+            self.added("unrelated", [])
+
+        def poll(self):
+            self.step += 1
+            if self.step == 2:
+                assert entered.wait(5)
+                self.removed("unrelated", "input device disconnected")
+            if self.step <= cycles:
+                # All remaining cycles must be handled while transcription
+                # of the first recording is blocked in the worker.
+                assert not release.is_set()
+                return [("physical", key(app.KEY_TALK, 1)),
+                        ("mirror", key(app.KEY_TALK, 1)),
+                        ("physical", key(app.KEY_TALK, 0)),
+                        ("mirror", key(app.KEY_TALK, 0))]
+            assert len(captures) == cycles
+            assert not stopped  # Phonon remains running during all input.
+            release.set()
+            assert complete.wait(5)
+            raise KeyboardInterrupt
+
+        def close(self):
+            release.set()
+
+    monkeypatch.setattr(app, "KeyboardMonitor", Monitor)
+    app.main()
+    assert pasted == [path.name for path in captures]
+    assert stopped == [server]
     assert not list(tmp_path.iterdir())

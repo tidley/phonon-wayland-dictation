@@ -138,6 +138,9 @@ systemctl --user disable --now phonon-dictation.service
 - Server startup fails: run `.venv/bin/fermion serve phonon-2` in a terminal to see the upstream diagnostic, check free cache space, and verify `curl http://127.0.0.1:8000/health` after startup.
 - No paste: check `systemctl --user status ydotool.service`, focus a graphical text editor, and ensure `wl-copy` is installed.
 - Wrong microphone: list PipeWire/PulseAudio sources and pass `--source NAME`.
+- Lost input events (`SYN_DROPPED`) indicate an evdev buffer overrun. Monitoring discards events through the next `SYN_REPORT`, queries held modifiers, and keeps the device open. Recording continues if the initiating keyboard still holds Right Ctrl; it is cancelled if that key is released or its state cannot be queried. Removing another keyboard does not cancel capture; ownership is not transferred if the initiating keyboard disconnects.
+
+Transcription and clipboard insertion run in a serial worker while the input loop drains readable devices to `EAGAIN`. Previously, synchronous transcription (up to 120 seconds), clipboard commands, and the paste delay prevented input reads; one read per readiness notification also left queued events behind. These are buffer-overrun contributors, especially with mirrored physical/Solaar streams. The exact source of overruns on a particular keyboard requires hardware observation.
 
 Hardware and compositor behaviour require manual testing. Before relying on the service, verify:
 
@@ -155,6 +158,7 @@ journalctl --user -u phonon-dictation.service -f
 7. Disconnect a keyboard while holding Right Ctrl; verify capture is cancelled, its temporary WAV is removed, and a fresh press records normally.
 8. Suspend/resume both while idle and while recording. Verify interrupted capture is discarded and new recordings work, including when input event paths remain unchanged.
 9. Repeat with Solaar enabled and confirm one recording/transcription per gesture. Check that the Phonon server PID remains unchanged throughout hotplug and resume tests.
+10. With the Logitech keyboard, hold Right Ctrl continuously for 30 seconds, then release; confirm no premature cancellation. Repeat rapid dictation cycles and type while transcription is in progress. Disconnect an unrelated keyboard during capture; confirm recording continues. Repeat with Solaar both enabled and disabled and check that input recovery produces no false `Input device removed` log.
 
 These hardware-specific recovery scenarios must be checked on the target laptop/dock; mocked automated tests do not establish physical suspend or hotplug results.
 

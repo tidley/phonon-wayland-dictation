@@ -11,12 +11,14 @@ import sys
 import subprocess
 import tempfile
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from evdev import ecodes
 
-from .keyboards import KeyboardMonitor, ResumeWatch
+from .keyboards import KeyboardMonitor, KeySnapshot, ResumeWatch, suspend_offset
 
 
 KEY_TALK = ecodes.KEY_RIGHTCTRL
@@ -29,11 +31,16 @@ KEYCODES = {
 
 @dataclass
 class KeyboardState:
-    """Track modifiers, coalescing mirrored physical/virtual key events."""
+    """Coalesce mirrored presses; only the initiating source can end capture.
+
+    evdev cannot identify which sources are mirrors of the same physical key,
+    so never transfer ownership based only on another source holding Ctrl.
+    """
 
     shift_devices: set[str] = field(default_factory=set)
     talk_devices: set[str] = field(default_factory=set)
     recording: bool = False
+    owner: str | None = None
     terminal_requested: bool = False
 
     def added(self, path, held):
@@ -46,18 +53,37 @@ class KeyboardState:
     def removed(self, path):
         self.shift_devices.discard(path)
         self.talk_devices.discard(path)
-        cancel = self.recording
-        self.recording = False
-        self.terminal_requested = False
+        cancel = self.recording and self.owner == path
+        if cancel:
+            self.recording = False
+            self.owner = None
+            self.terminal_requested = False
         return cancel
+
+    def recovered(self, path, held):
+        self.shift_devices.discard(path)
+        self.talk_devices.discard(path)
+        if held is not None:
+            self.added(path, held)
+            if self.recording and KEY_SHIFT in held:
+                self.terminal_requested = True
+        if self.recording and self.owner == path and (held is None or KEY_TALK not in held):
+            self.recording = False
+            self.owner = None
+            self.terminal_requested = False
+            return "cancel"
+        return None
 
     def reset(self):
         self.shift_devices.clear()
         self.talk_devices.clear()
         self.recording = False
+        self.owner = None
         self.terminal_requested = False
 
     def handle(self, device_path: str, event) -> str | None:
+        if isinstance(event, KeySnapshot):
+            return self.recovered(device_path, event.held)
         if event.type != ecodes.EV_KEY:
             return None
         if event.code == KEY_SHIFT and event.value in (0, 1):
@@ -76,15 +102,14 @@ class KeyboardState:
             if already_held or self.recording:
                 return None
             self.recording = True
+            self.owner = device_path
             self.terminal_requested = bool(self.shift_devices)
             return "start"
         if event.value == 0:
-            if device_path not in self.talk_devices:
-                # Some input stacks route the release through another source.
-                self.talk_devices.clear()
             self.talk_devices.discard(device_path)
-            if self.recording:
+            if self.recording and self.owner == device_path:
                 self.recording = False
+                self.owner = None
                 return "stop"
         return None
 
@@ -167,8 +192,12 @@ def stop_process(process: subprocess.Popen, stop_signal: int = signal.SIGINT):
     """Stop a child without leaving a recorder or owned server behind."""
     if process.poll() is not None:
         return
+    process.send_signal(stop_signal)
+    wait_process(process)
+
+
+def wait_process(process):
     try:
-        process.send_signal(stop_signal)
         process.wait(timeout=5)
     except subprocess.TimeoutExpired:
         process.kill()
@@ -178,6 +207,32 @@ def stop_process(process: subprocess.Popen, stop_signal: int = signal.SIGINT):
 def remove_recording(path: Path | None):
     if path is not None:
         path.unlink(missing_ok=True)
+
+
+def finish_dictation(process, path, mode, args, offset, stopping):
+    """Serial worker owns completed captures; input monitoring never waits on it."""
+    try:
+        wait_process(process)
+        if stopping.is_set() or suspend_offset() - offset > 0.1:
+            print("Recording discarded: system resumed or application stopped", flush=True)
+            return
+        # FFmpeg returns 255 for a clean SIGINT shutdown.
+        if process.returncode not in (0, 255):
+            print("Recording failed; skipped", flush=True)
+            return
+        if path.stat().st_size < 1000:
+            print("Recording too short; skipped", flush=True)
+            return
+        text = transcribe(path, args.api_url)
+        if stopping.is_set() or suspend_offset() - offset > 0.1:
+            print("Dictation discarded: system resumed or application stopped", flush=True)
+        elif text:
+            print("Transcription complete", flush=True)
+            paste(text, mode, args.delay)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print(f"Dictation error: {exc}", flush=True)
+    finally:
+        remove_recording(path)
 
 
 def main():
@@ -204,6 +259,8 @@ def main():
 
     monitor = KeyboardMonitor(keyboard_state.added, device_removed)
     resume = ResumeWatch()
+    stopping = threading.Event()
+    worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dictation")
 
     try:
         server_proc = ensure_server(args)
@@ -219,7 +276,9 @@ def main():
                 continue
             for device_path, event in events:
                 action = keyboard_state.handle(device_path, event)
-                if action == "start":
+                if action == "cancel":
+                    cancel_recording("controlling key released or unavailable after input recovery")
+                elif action == "start":
                     with tempfile.NamedTemporaryFile(suffix=".wav", prefix="phonon-dictation-", delete=False) as f:
                         recording_path = Path(f.name)
                     try:
@@ -230,52 +289,32 @@ def main():
                         )
                     except OSError as exc:
                         keyboard_state.recording = False
+                        keyboard_state.owner = None
                         remove_recording(recording_path)
                         recording_path = None
                         print(f"Could not start microphone recording: {exc}", flush=True)
                         continue
                     print("Recording...", flush=True)
                 elif action == "stop" and recording is not None:
-                    stop_process(recording)
-                    capture_status = recording.returncode
-                    recording = None
                     selected_mode = "terminal" if keyboard_state.terminal_requested else args.mode
                     print(f"Paste mode: {selected_mode}", flush=True)
-                    try:
-                        if resume.resumed():
-                            keyboard_state.reset()
-                            monitor.reset("system resumed")
-                            print("Recording discarded: system resumed", flush=True)
-                            break
-                        # FFmpeg returns 255 for a clean SIGINT shutdown.
-                        if capture_status not in (0, 255):
-                            print("Recording failed; skipped", flush=True)
-                            continue
-                        if recording_path.stat().st_size < 1000:
-                            print("Recording too short; skipped", flush=True)
-                            continue
-                        text = transcribe(recording_path, args.api_url)
-                        if resume.resumed():
-                            keyboard_state.reset()
-                            monitor.reset("system resumed")
-                            print("Dictation discarded: system resumed during transcription", flush=True)
-                            break
-                        elif text:
-                            print("Transcription complete", flush=True)
-                            paste(text, selected_mode, args.delay)
-                    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
-                        print(f"Dictation error: {exc}", flush=True)
-                    finally:
-                        remove_recording(recording_path)
-                        recording_path = None
+                    offset = suspend_offset()
+                    if recording.poll() is None:
+                        recording.send_signal(signal.SIGINT)
+                    worker.submit(finish_dictation, recording, recording_path,
+                                  selected_mode, args, offset, stopping)
+                    recording = None
+                    recording_path = None
     except KeyboardInterrupt:
         print("\nStopped.", flush=True)
     finally:
+        stopping.set()
         if recording is not None:
             stop_process(recording)
         if recording_path is not None:
             remove_recording(recording_path)
         monitor.close()
+        worker.shutdown(wait=True)
         if server_proc is not None and server_proc.poll() is None:
             stop_process(server_proc, signal.SIGTERM)
 
