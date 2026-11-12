@@ -89,7 +89,7 @@ def rig(monkeypatch):
 
     monkeypatch.setattr(keyboards, "InputDevice", open_device)
     monkeypatch.setattr(keyboards, "os", SimpleNamespace(
-        stat=lambda path: SimpleNamespace(st_rdev=1, st_ino=devices[path].inode),
+        stat=lambda path: SimpleNamespace(st_rdev=1, st_ino=getattr(devices[path], "inode", 1)),
         fstat=lambda dev: SimpleNamespace(st_rdev=1, st_ino=dev.inode),
     ))
     state = app.KeyboardState()
@@ -186,6 +186,71 @@ def test_permission_denied_retried_without_log_spam(rig, capsys):
     rig.monitor.next_scan = 0
     rig.monitor.poll(0)
     assert "locked" in rig.monitor.devices
+
+
+def test_periodic_scans_do_not_reopen_unchanged_ignored_devices(rig):
+    rig.devices.update({
+        "kbd": Device("kbd"),
+        "mouse": Device("mouse", caps=[]),
+        "synthetic": Device("synthetic", "ydotoold virtual device"),
+    })
+    rig.monitor.reconcile()
+    opened = list(rig.opened)
+    for _ in range(10):
+        rig.monitor.next_scan = 0
+        rig.monitor.poll(0)
+    assert rig.opened == opened
+    assert set(rig.monitor.ignored) == {"mouse", "synthetic"}
+    assert set(rig.monitor.devices) == {"kbd"}
+
+
+def test_ignored_device_replaced_at_same_path_is_reprobed(rig):
+    rig.devices["event1"] = Device("event1", caps=[])
+    rig.monitor.reconcile()
+    new = rig.devices["event1"] = Device("event1", inode=2)
+    rig.monitor.reconcile()
+    assert rig.monitor.devices["event1"] is new
+    assert "event1" not in rig.monitor.ignored
+
+
+def test_ignored_cache_pruned_on_disappearance_without_udev(rig):
+    rig.devices["event1"] = Device("event1", caps=[])
+    rig.monitor.reconcile()
+    del rig.devices["event1"]
+    rig.monitor.reconcile()
+    assert not rig.monitor.ignored
+    new = rig.devices["event1"] = Device("event1")
+    rig.monitor.reconcile()
+    assert rig.monitor.devices["event1"] is new
+
+
+@pytest.mark.parametrize("action", ["add", "change", "remove"])
+def test_udev_invalidates_ignored_identity(rig, action):
+    rig.devices["event1"] = Device("event1", caps=[])
+    rig.monitor.reconcile()
+    # Model a same-identity notification: cache invalidation must not rely
+    # solely on stat, including when inode numbers have been reused.
+    new = rig.devices["event1"] = Device("event1")
+    notify(rig, action, "event1")
+    assert rig.monitor.devices["event1"] is new
+
+
+def test_resume_reset_reprobes_ignored_devices(rig):
+    rig.devices["event1"] = Device("event1", caps=[])
+    rig.monitor.reconcile()
+    new = rig.devices["event1"] = Device("event1")
+    rig.monitor.reset("system resumed")
+    assert rig.monitor.devices["event1"] is new
+
+
+def test_inaccessible_device_is_not_cached_as_ignored(rig):
+    rig.devices["locked"] = PermissionError(errno.EACCES, "Permission denied")
+    rig.monitor.reconcile()
+    assert "locked" not in rig.monitor.ignored
+    rig.devices["locked"] = Device("locked", caps=[])
+    rig.monitor.reconcile()
+    assert "locked" in rig.monitor.ignored
+    assert "locked" not in rig.monitor.inaccessible
 
 
 @pytest.mark.parametrize("error", [errno.ENODEV, errno.EBADF, errno.EIO])

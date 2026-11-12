@@ -4,6 +4,8 @@ Offline, whole-recording push-to-talk dictation for Debian GNOME on Wayland. Hol
 
 The model is downloaded once from its upstream source. After that download, audio is processed locally: recordings are sent only to `127.0.0.1`, not to a hosted transcription service.
 
+See [CHANGELOG.md](CHANGELOG.md) for changes and verification notes.
+
 ## Features
 
 - Full-recording transcription on key release, not incremental transcription.
@@ -141,6 +143,8 @@ systemctl --user disable --now phonon-dictation.service
 - Lost input events (`SYN_DROPPED`) indicate an evdev buffer overrun. Monitoring discards events through the next `SYN_REPORT`, queries held modifiers, and keeps the device open. Recording continues if the initiating keyboard still holds Right Ctrl; it is cancelled if that key is released or its state cannot be queried. Removing another keyboard does not cancel capture; ownership is not transferred if the initiating keyboard disconnects.
 
 Transcription and clipboard insertion run in a serial worker while the input loop drains readable devices to `EAGAIN`. Previously, synchronous transcription (up to 120 seconds), clipboard commands, and the paste delay prevented input reads; one read per readiness notification also left queued events behind. These are buffer-overrun contributors, especially with mirrored physical/Solaar streams. The exact source of overruns on a particular keyboard requires hardware observation.
+
+Periodic discovery also caches successfully inspected devices without the hotkey modifiers, avoiding slow repeated opens that can delay keyboard reads. Device identity changes, udev notifications, and resume invalidate this cache; inaccessible devices are still retried for permission recovery.
 
 Hardware and compositor behaviour require manual testing. Before relying on the service, verify:
 

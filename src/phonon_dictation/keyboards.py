@@ -52,6 +52,7 @@ class KeyboardMonitor:
         self.removed = removed
         self.devices = {}
         self.identities = {}
+        self.ignored = {}
         self.syncing = set()
         self.inaccessible = set()
         self.available = None
@@ -94,18 +95,28 @@ class KeyboardMonitor:
             if path not in paths or not unchanged:
                 self.discard(path)
         self.inaccessible.intersection_update(paths)
+        self.ignored = {path: identity for path, identity in self.ignored.items() if path in paths}
         for path in sorted(paths - self.devices.keys()):
             dev = None
             try:
+                identity = self.identity(os.stat(path))
+                if self.ignored.get(path) == identity:
+                    continue
+                self.ignored.pop(path, None)
                 dev = InputDevice(path)
+                identity = self.identity(os.fstat(dev.fd))
                 caps = dev.capabilities().get(ecodes.EV_KEY, [])
                 # ydotoold's default uinput name; don't exclude Solaar or
                 # arbitrary legitimate devices just because they're virtual.
                 modifiers = {ecodes.KEY_RIGHTCTRL, ecodes.KEY_RIGHTSHIFT}
                 if not modifiers.intersection(caps) or "ydotool" in dev.name.casefold():
+                    # Opening and probing every irrelevant device can stall
+                    # keyboard reads long enough to overflow evdev buffers.
+                    # Cache only successful probes, keyed by device identity.
+                    self.ignored[path] = identity
+                    self.inaccessible.discard(path)
                     close_device(dev)
                     continue
-                identity = self.identity(os.fstat(dev.fd))
                 held = dev.active_keys()
                 self.selector.register(dev, selectors.EVENT_READ, dev)
                 self.devices[path] = dev
@@ -127,6 +138,7 @@ class KeyboardMonitor:
         self.next_scan = time.monotonic() + 5
 
     def reset(self, reason):
+        self.ignored.clear()
         for path in list(self.devices):
             self.discard(path, reason)
         self.reconcile()
@@ -137,6 +149,9 @@ class KeyboardMonitor:
         for key, _ in ready:
             if key.data is None:
                 while (event := self.udev.poll(timeout=0)) is not None:
+                    # A same-path replacement or capability change must be
+                    # reconsidered, even if stat happens to match the cache.
+                    self.ignored.pop(event.device_node, None)
                     if event.action == "remove":
                         self.discard(event.device_node)
                 self.next_scan = 0
