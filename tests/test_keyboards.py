@@ -542,12 +542,16 @@ def test_main_cancels_capture_cleans_file_and_keeps_server(monkeypatch, tmp_path
 
 
 @pytest.mark.parametrize("suspended", [False, True])
-def test_main_transcription_privacy_and_resume_before_paste(monkeypatch, tmp_path, capsys, suspended):
-    monkeypatch.setattr(app.sys, "argv", ["phonon-dictate"])
+@pytest.mark.parametrize("destination", ["clipboard", "ibus"])
+def test_main_transcription_privacy_and_resume_before_paste(monkeypatch, tmp_path, capsys, suspended, destination):
+    monkeypatch.setattr(app.sys, "argv", ["phonon-dictate", "--output", destination])
     monkeypatch.setattr(app.tempfile, "tempdir", str(tmp_path))
     monkeypatch.setattr(app, "ensure_server", lambda args: None)
     monkeypatch.setattr(app, "stop_process", lambda *args: None)
     pasted = []
+    native = []
+    reserved = {"request_id": "capture-start", "token": "original-field"}
+    monkeypatch.setattr(app.ibus, "begin", lambda mode: reserved if mode == "ibus" else None)
 
     def capture(command, **kwargs):
         app.Path(command[-1]).write_bytes(b"x" * 2000)
@@ -569,6 +573,10 @@ def test_main_transcription_privacy_and_resume_before_paste(monkeypatch, tmp_pat
 
     monkeypatch.setattr(app, "transcribe", transcribe)
     monkeypatch.setattr(app, "paste", paste)
+    def commit(target, text):
+        native.append((target, text))
+        finished.set()
+    monkeypatch.setattr(app.ibus, "commit", commit)
     monkeypatch.setattr(app, "suspend_offset", lambda: offset[0])
 
     class Monitor:
@@ -598,7 +606,8 @@ def test_main_transcription_privacy_and_resume_before_paste(monkeypatch, tmp_pat
     monkeypatch.setattr(app, "KeyboardMonitor", Monitor)
     monkeypatch.setattr(app, "ResumeWatch", lambda: SimpleNamespace(resumed=lambda: False))
     app.main()
-    assert pasted == ([] if suspended else [("private transcription", "terminal", 0.25)])
+    assert pasted == ([] if suspended or destination == "ibus" else [("private transcription", "terminal", 0.25)])
+    assert native == ([] if suspended or destination == "clipboard" else [(reserved, "private transcription")])
     assert "private transcription" not in capsys.readouterr().out
     assert not list(tmp_path.iterdir())
 

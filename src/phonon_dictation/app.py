@@ -1,4 +1,4 @@
-"""Hold Right Ctrl to record, release to transcribe and paste."""
+"""Hold Right Ctrl to record, release to transcribe and insert text."""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +19,7 @@ from pathlib import Path
 from evdev import ecodes
 
 from .keyboards import KeyboardMonitor, KeySnapshot, ResumeWatch, suspend_offset
+from . import ibus
 
 
 KEY_TALK = ecodes.KEY_RIGHTCTRL
@@ -116,6 +117,8 @@ class KeyboardState:
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--output", choices=("clipboard", "ibus", "auto"), default=os.getenv("PHONON_OUTPUT", "clipboard"),
+                   help="Text destination; auto uses IBus when Phonon is selected")
     p.add_argument("--mode", choices=KEYCODES, default=os.getenv("PHONON_PASTE_MODE", "normal"),
                    help="Fallback paste mode when Right Shift was not held (default: normal)")
     p.add_argument("--source", default=os.getenv("PHONON_MIC", "default"), help="PulseAudio/PipeWire source name")
@@ -209,7 +212,7 @@ def remove_recording(path: Path | None):
         path.unlink(missing_ok=True)
 
 
-def finish_dictation(process, path, mode, args, offset, stopping):
+def finish_dictation(process, path, mode, args, offset, stopping, target=None):
     """Serial worker owns completed captures; input monitoring never waits on it."""
     try:
         wait_process(process)
@@ -228,7 +231,10 @@ def finish_dictation(process, path, mode, args, offset, stopping):
             print("Dictation discarded: system resumed or application stopped", flush=True)
         elif text:
             print("Transcription complete", flush=True)
-            paste(text, mode, args.delay)
+            if target is not None:
+                ibus.commit(target, text)
+            else:
+                paste(text, mode, args.delay)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         print(f"Dictation error: {exc}", flush=True)
     finally:
@@ -242,6 +248,7 @@ def main():
     server_proc = None
     recording = None
     recording_path = None
+    recording_target = None
     keyboard_state = KeyboardState()
 
     def cancel_recording(reason):
@@ -279,6 +286,13 @@ def main():
                 if action == "cancel":
                     cancel_recording("controlling key released or unavailable after input recovery")
                 elif action == "start":
+                    try:
+                        recording_target = ibus.begin(args.output)
+                    except OSError as exc:
+                        keyboard_state.recording = False
+                        keyboard_state.owner = None
+                        print(f"Dictation unavailable: {exc}", flush=True)
+                        continue
                     with tempfile.NamedTemporaryFile(suffix=".wav", prefix="phonon-dictation-", delete=False) as f:
                         recording_path = Path(f.name)
                     try:
@@ -297,12 +311,12 @@ def main():
                     print("Recording...", flush=True)
                 elif action == "stop" and recording is not None:
                     selected_mode = "terminal" if keyboard_state.terminal_requested else args.mode
-                    print(f"Paste mode: {selected_mode}", flush=True)
+                    print("Output: IBus" if recording_target is not None else f"Paste mode: {selected_mode}", flush=True)
                     offset = suspend_offset()
                     if recording.poll() is None:
                         recording.send_signal(signal.SIGINT)
                     worker.submit(finish_dictation, recording, recording_path,
-                                  selected_mode, args, offset, stopping)
+                                  selected_mode, args, offset, stopping, recording_target)
                     recording = None
                     recording_path = None
     except KeyboardInterrupt:

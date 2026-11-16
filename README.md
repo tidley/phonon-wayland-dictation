@@ -85,7 +85,7 @@ The trigger keys remain visible to the focused application. Pressing Right Shift
 
 Input devices are discovered at startup and registered dynamically using `pyudev` and a selector. A five-second reconciliation scan also catches missed notifications, recreated event nodes, and devices that become readable after a permission/ACL change. No fixed event numbers are configured. When no usable keyboards are connected, the application waits and resumes monitoring when one appears; the speech server stays loaded.
 
-Shift state is tracked per keyboard. Shift held before Ctrl, or pressed during a recording, selects terminal paste even if Shift is released first. Mirrored physical/Solaar events are merged by timestamp and repeated Ctrl presses are coalesced. The first Ctrl release ends the recording, including a release routed through another keyboard; remaining mirrored releases do not submit it again. Release held trigger keys before starting another recording or after reconnecting a keyboard.
+Shift state is tracked per keyboard. Shift held before Ctrl, or pressed during a recording, selects terminal paste even if Shift is released first. Mirrored physical/Solaar events are merged by timestamp and repeated Ctrl presses are coalesced. Only the keyboard that initiated recording can stop it with a Ctrl release; unrelated or mirrored releases do not submit it again. Release held trigger keys before starting another recording or after reconnecting a keyboard. The terminal paste modifier applies to clipboard output; native IBus insertion does not need it.
 
 Removing a monitored keyboard during recording conservatively cancels that recording, clears that device's modifier state, stops FFmpeg, and deletes the WAV without transcription or paste. Lost evdev events (`SYN_DROPPED`) and stale-device read errors also trigger safe recovery. On resume, the application detects elapsed suspend time using Linux's suspend-inclusive clock, cancels interrupted capture, clears modifiers, and reopens input handles even when event paths have not changed. No logind D-Bus dependency or systemd restart hook is needed. Resume checks occur at least once per second while the input loop is idle. A recording interrupted by resume is discarded, including when resume is detected before/during transcription.
 
@@ -101,6 +101,29 @@ PHONON_PASTE_MODE=terminal .venv/bin/phonon-dictate
 ```
 
 `--api-url` accepts only an HTTP loopback endpoint (`localhost`, `127.0.0.1`, or `::1`). `--server-command` defaults to `fermion serve phonon-2`; that command binds locally by default. Set `FERMION_CACHE_DIR` or `HF_HOME` before installation if model files should live on another volume.
+
+## Native IBus Input (Optional)
+
+Phonon can also be selected as a GNOME input source, inserting text directly
+without clipboard changes or simulated paste. The engine is Rust and uses the
+GB keyboard layout. Install the existing dictation service first, then install
+the optional engine from this checkout (current Rust/Cargo and `libxkbcommon-dev`
+are needed for its build):
+
+```bash
+/usr/bin/python3 install_ibus.py --configure-service --add-source --refresh
+```
+
+Run this while not recording: the refresh briefly restarts GNOME IBus and the
+dictation service. Select **Phonon Dictation (English, UK)** using **Super+Space**
+or the top-bar input-source menu, focus a text field, and dictate as usual.
+Your other sources are retained. Selecting your regular source restores the
+clipboard destination; native recordings log `Output: IBus` and need no terminal
+paste-mode modifier.
+
+See the [IBus guide](rust/ibus-helper/README.md) for installation details,
+focus behavior, developer tests, compatibility checks, and uninstallation.
+Native application compatibility is still being validated under [issue #2](https://github.com/tidley/phonon-wayland-dictation/issues/2).
 
 ## Terminals And SSH
 
@@ -178,6 +201,10 @@ rm -rf .venv
 Remove the project checkout separately if desired. Remove downloaded model data using the cache location reported by `fermion models`; do not remove unrelated Hugging Face cache entries unless intended. Remove yourself from the `input` group only after verifying no other software needs it.
 
 ## Contributing
+
+Native IBus output is provided by an [optional Rust helper](rust/ibus-helper/README.md).
+See the [feasibility investigation](IBUS_INVESTIGATION.md) and [issue #2](https://github.com/tidley/phonon-wayland-dictation/issues/2).
+Its isolated integration test does not change the running dictation service or desktop input source.
 
 Install test dependencies with `.venv/bin/python -m pip install -e '.[test]'`, then run the hardware-independent suite with `PYTHONPATH=src .venv/bin/python -m pytest`. The explicit source path also avoids testing an older non-editable installed copy. Do not commit recordings, model caches, virtual environments, logs, credentials, machine-specific service files, or other private data. Please include manual test notes for changes affecting audio, keyboard input, Wayland, or terminals.
 
