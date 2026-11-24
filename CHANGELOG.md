@@ -4,6 +4,14 @@
 
 ### Added
 
+- NixOS installation with a declarative IBus engine package and graphical-login
+  service using `--output auto`. Existing NixOS IBus engines are retained through
+  list merging. The supplied Nix shell includes the native build/runtime
+  dependencies and keeps Cargo output separate from Debian's shared-checkout
+  artefacts and virtualenv.
+- `install_ibus.py --register-only` for GNOME source registration after installing
+  the engine declaratively, and `--packaged` integration tests for NixOS's actual
+  IBus wrapper and descriptor discovery.
 - Optional Rust IBus input source with per-user GNOME installation, native text
   insertion, Compose/dead-key and Unicode entry, runtime-socket IPC, focus tokens,
   and request deduplication ([#2]). The installer preserves other input sources
@@ -14,6 +22,11 @@
 
 ### Fixed
 
+- Discover and preserve IBus component paths instead of assuming
+  `/usr/share/ibus/component`. NixOS uses its engine package mechanism because
+  its wrapper replaces `IBUS_COMPONENT_PATH`; an environment-only drop-in does
+  not work there. Conventional per-user installation remains supported.
+- Honour `CARGO_TARGET_DIR` for both build and `--no-build` installation.
 - Serialize IBus engine-property replies so initial focus-ID negotiation remains
   reliable when selecting or restarting the native engine.
 - Recover from evdev `SYN_DROPPED` without treating the keyboard as disconnected:
@@ -34,16 +47,23 @@
 
 ### Verification
 
-- 64 automated Python tests cover input recovery, recording ownership, mirrored events,
+- 67 automated Python tests cover input recovery, recording ownership, mirrored events,
   input during transcription and paste, device-cache invalidation, hotplug,
   permission retries, suspend/resume handling, native-output routing/failures,
-  and installer configuration preservation.
-- Both real-IBus integration modes pass against an isolated daemon, including
-  staged installation/activation and helper restart. Rust release build, Clippy,
-  and formatting checks pass.
+  installer configuration preservation, component-path discovery, and separate
+  build-target selection.
+- All three real-IBus integration modes pass against an isolated daemon on
+  NixOS 26.05 / IBus 1.5.33: runtime registration/helper restart, staged
+  installation, and Nix-packaged discovery/activation. Rust release build,
+  Clippy, and formatting checks pass with Nix-managed Rust 1.95.
+- A real GNOME 50.6 Wayland GTK scratch field received a Unicode native commit
+  with identical clipboard contents before and after. The existing service
+  started with auto output, healthy keyboard monitoring, and the cached local
+  Phonon-2 CPU model. Physical speech/hotkey, logout/reboot, and system-activated
+  rebuild checks remain manual; this desktop test supplied known text directly.
 - The user confirmed normal keyboard typing and Right Ctrl dictation with Phonon
   selected on GNOME, with `Output: IBus` in the service log. The full application
-  compatibility matrix, clipboard-preservation observation, and remaining manual
+  compatibility matrix and remaining manual
   focus/lifecycle scenarios are still tracked in [#2].
 - On the affected Logitech setup, initial discovery took approximately 1.43
   seconds; subsequent cached scans took 0.12–0.50 milliseconds with no device

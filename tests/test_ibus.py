@@ -101,3 +101,30 @@ def test_installer_preserves_existing_service_and_rejects_foreign_dropin(tmp_pat
     dropin.write_text("someone else's configuration\n")
     with pytest.raises(SystemExit, match="unrelated configuration"):
         installer.install(prefix, config, binary, True)
+
+
+def test_component_discovery_keeps_overrides_and_xdg_components(monkeypatch, tmp_path):
+    installer = installer_module()
+    components = tmp_path / "share/ibus/component"
+    components.mkdir(parents=True)
+    monkeypatch.setenv("IBUS_COMPONENT_PATH", "/custom/one/:/custom/two:/custom/one")
+    monkeypatch.setenv("XDG_DATA_DIRS", str(tmp_path / "share"))
+    monkeypatch.setattr(installer.shutil, "which", lambda _: None)
+    def unavailable(*args, **kwargs):
+        raise FileNotFoundError()
+    monkeypatch.setattr(installer.subprocess, "check_output", unavailable)
+    assert installer.component_paths() == ["/custom/one", "/custom/two", str(components)]
+
+
+def test_explicit_cargo_target_is_used_for_build_and_no_build(monkeypatch, tmp_path):
+    installer = installer_module()
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path / "nix-target"))
+    assert installer.target_directory() == tmp_path / "nix-target"
+
+
+def test_descriptor_generation_does_not_install_user_configuration(tmp_path):
+    installer = installer_module()
+    helper = Path("/nix/store/example/bin/phonon-ibus-helper")
+    descriptor = installer.write_descriptor(helper, tmp_path / "components")
+    assert str(helper) in descriptor.read_text()
+    assert list(tmp_path.iterdir()) == [tmp_path / "components"]

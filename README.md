@@ -1,6 +1,6 @@
 # Phonon Wayland Dictation
 
-Offline, whole-recording push-to-talk dictation for Debian GNOME on Wayland. Hold a key while speaking; on release, the complete recording is transcribed by a local [Fermion Research Phonon-2](https://pypi.org/project/fermion-research/) server and pasted into the focused application.
+Offline, whole-recording push-to-talk dictation for Linux GNOME on Wayland, including Debian and NixOS. Hold a key while speaking; on release, the complete recording is transcribed by a local [Fermion Research Phonon-2](https://pypi.org/project/fermion-research/) server and inserted through IBus or pasted into the focused application.
 
 The model is downloaded once from its upstream source. After that download, audio is processed locally: recordings are sent only to `127.0.0.1`, not to a hosted transcription service.
 
@@ -18,11 +18,14 @@ See [CHANGELOG.md](CHANGELOG.md) for changes and verification notes.
 
 ## Support
 
-This release has been exercised on Debian 13 GNOME Wayland, Python 3.13, and an AMD Ryzen 7 PRO 7840U using CPU inference. It needs enough memory for the local runtime; observed use is roughly 870-960 MB. Other Debian versions and Wayland desktops may work but are not validated here.
+This release has been exercised on Debian 13 GNOME Wayland and NixOS 26.05 GNOME Wayland with Python 3.13 and CPU inference. It needs enough memory for the local runtime; observed use on an AMD Ryzen 7 PRO 7840U is roughly 870-960 MB. Other distributions and Wayland desktops may work but are not validated here.
 
 Phonon-2 and the `fermion-research` runtime are separate upstream software. Their model weights are downloaded into the Fermion/Hugging Face cache, are not included in this repository, and remain subject to their upstream terms.
 
 ## Installation
+
+For NixOS, use the [NixOS instructions](#nixos-installation) below. `install.sh`
+is the Debian installer and manages the project-local `.venv`.
 
 Clone the repository, then either install the Debian prerequisites yourself:
 
@@ -106,9 +109,10 @@ PHONON_PASTE_MODE=terminal .venv/bin/phonon-dictate
 
 Phonon can also be selected as a GNOME input source, inserting text directly
 without clipboard changes or simulated paste. The engine is Rust and uses the
-GB keyboard layout. Install the existing dictation service first, then install
-the optional engine from this checkout (current Rust/Cargo and `libxkbcommon-dev`
-are needed for its build):
+GB keyboard layout. On Debian and conventional distributions, install the
+existing dictation service first, then install the optional engine from this
+checkout (current Rust/Cargo and the libxkbcommon development package, named
+`libxkbcommon-dev` on Debian, are needed for its build):
 
 ```bash
 /usr/bin/python3 install_ibus.py --configure-service --add-source --refresh
@@ -125,6 +129,163 @@ See the [IBus guide](rust/ibus-helper/README.md) for installation details,
 focus behavior, developer tests, compatibility checks, and uninstallation.
 Native application compatibility is still being validated under [issue #2](https://github.com/tidley/phonon-wayland-dictation/issues/2).
 
+## NixOS Installation
+
+The integration has been built and tested on NixOS 26.05, GNOME 50.6,
+IBus 1.5.33 and Python 3.13. Use a separate Python environment and Cargo target
+when sharing this checkout with Debian. Do not run `install.sh` on NixOS.
+
+### Runtime environment
+
+`nix/shell.nix` supplies Nix-managed Python `evdev`, `pyudev` and PyGObject,
+FFmpeg, curl, PipeWire, PortAudio, libudev (systemd), the C/C++ runtime,
+wl-clipboard, ydotool, IBus, libxkbcommon, and the Rust/Cargo toolchain.
+It also includes pytest and the IBus/GI developer-test dependencies.
+This bypasses unconfigured system rustup shims. Its Cargo target is
+`build/nixos/ibus-helper`; Debian's `rust/ibus-helper/target` is retained.
+An explicit `CARGO_TARGET_DIR` is honoured by `install_ibus.py`, including with
+`--no-build`. Declarative Nix builds use their own sandbox target directories.
+
+For an existing working Nix environment, keep it and add any missing dependencies
+from this shell. For a new installation, enter `nix-shell nix/shell.nix`, then:
+
+```bash
+uv venv --python "$(command -v python)" --system-site-packages ~/.local/share/venvs/phonon-nix
+source ~/.local/share/venvs/phonon-nix/bin/activate
+uv pip install --torch-backend cpu fermion-research
+uv pip install --no-deps -e .
+python -c 'import evdev, pyudev; print(evdev.__file__, pyudev.__file__)'
+phonon-dictate --output clipboard
+```
+
+The import check should show Nix-managed input libraries. Run the application
+inside the Nix shell, including from systemd. The model downloads on first use;
+subsequent inference uses the local cache. Existing environments and model caches
+need no reinstallation or redownload.
+
+### Declarative engine and login service (recommended)
+
+Import `nix/module.nix` from your NixOS configuration. For example, add the
+following to `/etc/nixos/modules/dictation.nix`, using your actual checkout path:
+
+```nix
+imports = [ /home/alice/code/phonon-wayland-dictation/nix/module.nix ];
+services.phonon-dictation = {
+  enable = true;
+  user = "alice";
+  shellFile = "/home/alice/code/phonon-wayland-dictation/nix/shell.nix";
+  venv = "/home/alice/.local/share/venvs/phonon-nix";
+};
+```
+
+Alternatively, `shellFile` can name your existing
+`~/.config/phonon-nix/shell.nix` (use an absolute path).
+The module adds Phonon to `i18n.inputMethod.ibus.engines` using NixOS's list
+merging, retaining engines configured elsewhere. It builds the locked Rust
+helper with libxkbcommon, generates the same XML descriptor as the conventional
+installer, and keeps the entire runtime closure reachable from the system
+generation. It enables the standard ydotool system service and uses the
+`input`/`ydotool` groups, without changing device/socket permissions. Its Phonon
+user service is restricted to the configured user and starts at graphical login
+with **`--output auto`** and `YDOTOOL_SOCKET=/run/ydotoold/socket`.
+
+```bash
+sudo nixos-rebuild switch
+```
+
+If a hand-written `~/.config/systemd/user/phonon-dictation.service` already
+exists, it takes precedence over the declarative unit. Either keep it with
+`--output auto`, or back it up outside the systemd unit search path after
+rebuilding to use the declarative unit. `PHONON_OUTPUT=auto` cannot override an
+explicit `--output clipboard` argument. Inspect `systemctl --user cat
+phonon-dictation.service` to confirm the effective command.
+
+Log out and in (also required for newly added groups), then register the source:
+
+```bash
+nix-shell nix/shell.nix --run 'python install_ibus.py --register-only --add-source'
+systemctl --user status phonon-dictation.service
+```
+
+If staying in the current session, use `--register-only --add-source --refresh`
+when idle to restart IBus and discover the new package. Adding the GNOME source
+is idempotent and appends Phonon without replacing existing keyboard sources.
+Select **Phonon Dictation (English, UK)** with Super+Space or the top-bar menu.
+Both the engine and service survive logout, reboot and NixOS rebuilds while the
+module remains enabled; the checkout/runtime shell and virtualenv must be on a
+partition mounted before graphical login.
+
+**Why not the conventional installer?** NixOS's `ibus-with-plugins` wrapper
+unconditionally exports its own `IBUS_COMPONENT_PATH`. An environment-only
+systemd drop-in is ignored. Do not replace the path with
+`/usr/share/ibus/component`, pin discovered store paths into a global environment,
+or replace the existing engine list. `--register-only` leaves IBus paths and
+the helper installation under NixOS's control. On conventional distributions,
+the installer discovers the running daemon's and unit's component paths,
+XDG data directories and the installed IBus prefix instead of assuming `/usr`.
+
+### Migrating a manually configured IBus service
+
+If you previously activated a custom IBus package through a user-service
+`ExecStart` override, that override takes precedence over NixOS's generated
+unit. After successfully activating the system module, remove only the
+Phonon-specific bootstrap override (for example, `60-phonon-nixos.conf`), run
+`systemctl --user daemon-reload`, and log out/in. Verify the effective command
+with `systemctl --user cat org.freedesktop.IBus.session.GNOME.service` before
+removing its old package GC root. Preserve unrelated user-service configuration.
+
+A manually built package is a snapshot of its configured engines. Keeping a
+GC root retains that snapshot across rebuilds, but does not update it when the
+system's IBus version or engine list changes. Use the declarative module for
+automatic rebuild integration.
+
+### Verification
+
+```bash
+ibus list-engine                         # must contain phonon
+gsettings get org.gnome.desktop.input-sources sources
+systemctl status ydotoold.service        # system service on NixOS
+systemctl --user cat phonon-dictation.service
+journalctl --user -u phonon-dictation.service -f
+curl --fail http://127.0.0.1:8000/health
+```
+
+With Phonon selected, hold/release Right Ctrl in a scratch editor and terminal;
+expect `Output: IBus` and insertion without a clipboard change. Right Shift
+remains supported; native insertion needs no paste shortcut. With the ordinary
+keyboard source selected, test Right Ctrl clipboard paste and Right Ctrl + Right
+Shift terminal paste. Auto routing reserves its destination at recording start;
+changing focus/source during native transcription discards stale text rather
+than pasting it elsewhere. Repeat after logout/reboot and a NixOS rebuild.
+
+Developer checks (no changes to the real desktop input source):
+
+```bash
+nix-shell nix/shell.nix
+cargo build --release --locked --manifest-path rust/ibus-helper/Cargo.toml
+python rust/ibus-helper/tests/integration.py --helper "$CARGO_TARGET_DIR/release/phonon-ibus-helper"
+python rust/ibus-helper/tests/integration.py --installed --helper "$CARGO_TARGET_DIR/release/phonon-ibus-helper"
+PYTHONPATH=src python -m pytest -q
+```
+
+The integration harness also accepts `--packaged` to test the actual descriptor
+and automatic activation in an IBus package on `PATH`, in a private D-Bus session.
+See [nix/README.md](nix/README.md) for standalone package builds and a repeatable
+Nix-packaged integration-test command.
+To uninstall the declarative setup, remove/disable the module and rebuild;
+remove only Phonon's GNOME source in Settings. Keep other sources/components.
+
+NixOS migration verification: 67 Python tests passed; Rust release
+build, Clippy and formatting checks passed; private-daemon runtime registration,
+staged discovery and Nix-packaged discovery/activation passed on IBus 1.5.33.
+A dedicated GTK scratch window in the real GNOME Wayland session received a
+Unicode commit through Phonon, and its clipboard contents were identical before
+and after. The running service loaded the cached CPU model successfully and
+reported healthy keyboard monitoring. Physical speech/hotkey gestures,
+logout/reboot and administrator-activated rebuild checks still require a manual
+pass; the scratch test injected known text through the native client rather
+than recording speech.
+
 ## Terminals And SSH
 
 Terminal mode copies the text with `wl-copy`, waits for the configured delay, then sends a complete `Ctrl+Shift+V` press and release sequence. The trigger modifier is released before this happens. This is intended for GNOME terminals and SSH sessions inside them, including Herdr where its terminal frontend honors the standard paste shortcut.
@@ -133,7 +294,8 @@ Terminal emulators, browser terminals, remote desktops, and SSH frontends do not
 
 ## Automatic Startup And Logs
 
-Install and enable the user service:
+On NixOS, the [declarative module](#nixos-installation) supplies graphical-login
+startup. On Debian, install and enable the user service:
 
 ```bash
 ./install.sh --autostart
@@ -160,8 +322,8 @@ systemctl --user disable --now phonon-dictation.service
 ## Troubleshooting And Manual Checklist
 
 - No keyboard detected: confirm `id` shows the `input` group, then log out and in. Inspect `journalctl --user -u phonon-dictation.service` for inaccessible devices.
-- Server startup fails: run `.venv/bin/fermion serve phonon-2` in a terminal to see the upstream diagnostic, check free cache space, and verify `curl http://127.0.0.1:8000/health` after startup.
-- No paste: check `systemctl --user status ydotool.service`, focus a graphical text editor, and ensure `wl-copy` is installed.
+- Server startup fails: run `.venv/bin/fermion serve phonon-2` on Debian, or activate the separate virtualenv inside the Nix shell and run `fermion serve phonon-2` on NixOS. Check the upstream diagnostic, free cache space, and `curl http://127.0.0.1:8000/health` after startup.
+- No paste: check `systemctl --user status ydotool.service` on Debian, or `systemctl status ydotoold.service` and `YDOTOOL_SOCKET=/run/ydotoold/socket` on NixOS; focus a graphical text editor and ensure `wl-copy` is installed.
 - Wrong microphone: list PipeWire/PulseAudio sources and pass `--source NAME`.
 - Lost input events (`SYN_DROPPED`) indicate an evdev buffer overrun. Monitoring discards events through the next `SYN_REPORT`, queries held modifiers, and keeps the device open. Recording continues if the initiating keyboard still holds Right Ctrl; it is cancelled if that key is released or its state cannot be queried. Removing another keyboard does not cancel capture; ownership is not transferred if the initiating keyboard disconnects.
 
@@ -190,6 +352,13 @@ journalctl --user -u phonon-dictation.service -f
 These hardware-specific recovery scenarios must be checked on the target laptop/dock; mocked automated tests do not establish physical suspend or hotplug results.
 
 ## Uninstallation
+
+On NixOS, remove/disable the declarative module and rebuild, remove only Phonon's
+GNOME input source, and remove its separate virtualenv if no longer needed.
+Inspect and remove any Phonon-specific user-service overrides from an earlier
+manual installation. Keep other input sources and IBus components.
+
+For the Debian/project-local installation:
 
 ```bash
 systemctl --user disable --now phonon-dictation.service

@@ -1,13 +1,21 @@
 # Rust IBus input source
 
-Native offline dictation for Debian GNOME/Wayland, tracked in
+Native offline dictation for Linux GNOME/Wayland (Debian and NixOS), tracked in
 [issue #2](https://github.com/tidley/phonon-wayland-dictation/issues/2).
 The engine, Compose handling, focus tracking, and IPC server are Rust. The
 existing Python application still handles evdev, audio, and transcription.
 
 ## Install and select
 
-First install the speech application with the repository's normal installer.
+For NixOS, use the [declarative installation and Nix build shell](../../README.md#nixos-installation).
+Its IBus wrapper replaces `IBUS_COMPONENT_PATH`, so an environment-only drop-in
+cannot register an extra engine. Use `install_ibus.py --register-only --add-source`
+after activating the NixOS engine package. The instructions below apply to
+conventional distributions.
+
+On Debian, first install the speech application with `install.sh`. On other
+conventional distributions, install the equivalent runtime dependencies and
+Python application before adding the engine.
 Build requirements for this optional engine are a current Rust/Cargo toolchain
 and `libxkbcommon-dev`. Runtime requirements are `ibus`, `libxkbcommon0`, and
 the existing dictation service. The installer uses system Python/GI for GNOME
@@ -25,9 +33,10 @@ systemd drop-ins. No sudo is needed. Existing base service files and input
 sources are retained. The one-time refresh restarts GNOME IBus and dictation.
 Use `--no-build` when reinstalling an already built release.
 
-The IBus drop-in adds the user component directory alongside
-`/usr/share/ibus/component`: Debian's IBus does not search the user directory
-by default. The installer also rebuilds the user registry cache. The dictation
+The IBus drop-in adds the user component directory alongside discovered daemon,
+unit, XDG and distribution component directories: Debian's IBus does not search
+the user directory by default. Existing component paths are retained. The
+installer also rebuilds the user registry cache. The dictation
 drop-in sets `PHONON_OUTPUT=auto`.
 
 Select **Phonon Dictation (English, UK)** using **Super+Space** or GNOME's input
@@ -40,6 +49,9 @@ path. Automatic routing chooses a destination at recording start; native failure
 never trigger a paste retry. `--output ibus` requires a focused Phonon field;
 `--output clipboard` always uses the original path. CLI options override the
 `PHONON_OUTPUT` environment setting.
+
+If your custom service explicitly specifies `--output clipboard`, change that
+argument to `--output auto`; the environment setting cannot override the CLI.
 
 To install without restarting anything, omit `--refresh`, then log out and back
 in. To remove the native input source and its owned configuration:
@@ -90,6 +102,9 @@ reimplementation of every `IBus.EngineSimple` extension.
 
 ## Developer checks
 
+The commands below use Debian's system Python and project virtualenv. On NixOS,
+use the [Nix shell and separate target commands](../../nix/README.md).
+
 ```bash
 cargo build --locked --manifest-path rust/ibus-helper/Cargo.toml
 /usr/bin/python3 rust/ibus-helper/tests/integration.py
@@ -99,12 +114,16 @@ cargo fmt --manifest-path rust/ibus-helper/Cargo.toml -- --check
 PYTHONPATH=src .venv/bin/python -m pytest -q
 ```
 
-Both harness modes use a private D-Bus session, temporary config/cache/runtime
+All harness modes use a private D-Bus session, temporary config/cache/runtime
 directories, and a separate IBus daemon. The default mode explicitly registers
 the engine and tests helper restart; `--installed` stages the actual installer
 descriptor, builds a registry cache, and tests discovery and automatic activation.
 They do not select an engine on the real desktop or invoke clipboard/synthetic
 input commands. Python is only the independent IBus/GI test client.
+
+The `--packaged` mode tests the IBus package on `PATH` without staging a user
+descriptor. It verifies the NixOS wrapper's actual component search path and
+automatic engine activation; see the Nix guide for the build command.
 
 Assertions cover native IPC, exact Unicode/multiline commits and trailing space,
 duplicate/conflicting requests, ordinary press/release passthrough, Compose,
@@ -120,6 +139,12 @@ IBus 1.5.32 has two interoperability details captured in the implementation:
   matching libibus/GDBus, and never offers an unidentified field as a target.
 
 ## Manual desktop checks
+
+NixOS 26.05 / GNOME 50.6 / IBus 1.5.33 validation includes all three isolated
+integration modes and a native Unicode commit into a real GTK scratch field,
+with the clipboard unchanged. Cached local CPU model startup and keyboard
+monitoring passed. Physical speech/hotkey, login/reboot/rebuild and broader
+application checks remain manual; the GTK check supplied known text directly.
 
 Initial desktop validation on the target GNOME laptop confirmed normal keyboard
 typing and Right Ctrl dictation with Phonon selected, with `Output: IBus` in the

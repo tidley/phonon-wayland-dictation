@@ -1,6 +1,6 @@
 """Real Rust engine <-> IBus integration, with an isolated daemon and test clients.
 
-Python is only the test client (Debian's installed GI bindings); the engine is
+Python is only the test client (distribution-provided GI bindings); the engine is
 the compiled Rust binary. No audio, clipboard, synthetic keys, or desktop source
 changes are involved.
 """
@@ -219,7 +219,7 @@ def exercise(bus, helpers, installed=False):
         raise errors[0]
 
 
-def private_session(binary, installed=False):
+def private_session(binary, installed=False, packaged=False):
     with tempfile.TemporaryDirectory(prefix="phonon-ibus-test-") as root:
         address = f"unix:path={root}/bus"
         os.environ.update({
@@ -231,11 +231,11 @@ def private_session(binary, installed=False):
             "PHONON_IBUS_SOCKET": f"{root}/runtime/phonon/ibus.sock",
         })
         Path(root, "runtime").mkdir(mode=0o700)
-        if installed:
+        if installed and not packaged:
             sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-            from install_ibus import install
+            from install_ibus import install, component_paths
             _, descriptor = install(Path(root, "prefix"), Path(root, "config"), binary)
-            os.environ["IBUS_COMPONENT_PATH"] = f"/usr/share/ibus/component:{descriptor.parent}"
+            os.environ["IBUS_COMPONENT_PATH"] = os.pathsep.join([*component_paths(), str(descriptor.parent)])
             subprocess.run(["ibus", "write-cache"], check=True)
         os.environ.pop("DISPLAY", None)
         os.environ.pop("WAYLAND_DISPLAY", None)
@@ -263,11 +263,12 @@ if __name__ == "__main__":
     parser.add_argument("--helper", type=Path, default=Path(__file__).resolve().parents[1] / "target/debug/phonon-ibus-helper")
     parser.add_argument("--private-session", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--installed", action="store_true", help="Test component discovery and automatic activation from a staged installation")
+    parser.add_argument("--packaged", action="store_true", help="Test discovery from the IBus package on PATH instead of staging a descriptor (implies --installed)")
     args = parser.parse_args()
     if not args.helper.is_file():
         parser.error("Build the Rust helper first: cargo build --locked --manifest-path rust/ibus-helper/Cargo.toml")
     if args.private_session:
-        private_session(args.helper.resolve(), args.installed)
+        private_session(args.helper.resolve(), args.installed or args.packaged, args.packaged)
     else:
         # A fresh session bus prevents accidental use of the desktop's services.
         command = [
@@ -276,4 +277,6 @@ if __name__ == "__main__":
         ]
         if args.installed:
             command.append("--installed")
+        if args.packaged:
+            command.append("--packaged")
         raise SystemExit(subprocess.run(command).returncode)

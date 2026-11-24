@@ -1,5 +1,9 @@
 # Native IBus output: feasibility investigation
 
+This document retains the original Debian feasibility investigation. For current
+installation instructions, including NixOS, see the [README](README.md#native-ibus-input-optional)
+and [Rust helper guide](rust/ibus-helper/README.md).
+
 ## Conclusion
 
 Native text insertion is feasible on the inspected Debian GNOME/Wayland setup.
@@ -8,12 +12,12 @@ existing dictation process. The helper must be selected as an input method;
 IBus is not a general background application's text-injection API.
 
 Implementation is tracked in [issue #2](https://github.com/tidley/phonon-wayland-dictation/issues/2).
-The first Rust protocol milestone is in [rust/ibus-helper](rust/ibus-helper/README.md).
-The next stage adds a per-user installer and application output integration;
-see the helper guide for installation and selection. Initial investigation tests
+The Rust engine, per-user installer, application output integration, and
+declarative NixOS package are implemented; see the helper guide for installation
+and selection. Initial investigation tests
 used an isolated daemon and did not change desktop configuration.
 
-## Confirmed locally
+## Original Debian observations
 
 - GNOME Shell 48.7, IBus 1.5.32, and an active GNOME IBus daemon.
 - System Python can load the IBus introspection bindings; the speech application's
@@ -67,6 +71,29 @@ socket, reserved/deduplicated requests, application output routing, and
 libxkbcommon Compose/dead-key support. An additional staged-install harness
 verifies real descriptor discovery, cached registry loading, and activation
 by IBus. Desktop application compatibility remains a manual-validation task.
+
+### NixOS integration and verification
+
+On NixOS 26.05 with GNOME 50.6 and IBus 1.5.33, the installed
+`ibus-with-plugins` wrapper unconditionally replaces `IBUS_COMPONENT_PATH`.
+Therefore, extending that variable through a systemd environment drop-in is
+insufficient. The implementation packages the Rust helper and XML descriptor as
+an IBus engine and appends it through `i18n.inputMethod.ibus.engines`, preserving
+the other configured engines and rooting the runtime closure in the system
+generation. GNOME source registration remains per-user and preserves existing
+keyboard sources.
+
+Nix-managed Rust 1.95 and libxkbcommon build the helper successfully; development
+Cargo output is kept separate from the shared checkout's Debian target. The
+runtime-registration, staged-install and Nix-packaged integration modes pass
+against private IBus daemons. A dedicated GTK field in the actual GNOME Wayland
+session also received Unicode text through the native client without a clipboard
+change. Cached local CPU model startup and keyboard monitoring were verified.
+
+This desktop check supplied known text, not recorded speech. Physical hotkey
+dictation, broader toolkit compatibility, logout/reboot and administrator-activated
+rebuild persistence still need manual validation. See [CHANGELOG.md](CHANGELOG.md)
+for the current verification summary.
 
 ## Recommended architecture
 
@@ -127,7 +154,11 @@ If that becomes the larger implementation burden, Rust bindings to libibus and
 `EngineSimple` are a viable route, with GObject/GLib integration and development
 packages as additional build requirements.
 
-## Next implementation and validation steps
+## Original implementation plan and remaining validation
+
+Steps 1–3 are implemented and covered by the helper's automated tests. Steps
+4–6 remain the broader manual compatibility checklist; the NixOS GTK clipboard
+preservation check above covers one application and session.
 
 1. Build the Rust engine against an isolated IBus daemon. Verify exact Unicode
    and multiline commits, ordinary-key handling, focus/context IDs, and engine

@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import xml.etree.ElementTree as ET
 
@@ -23,15 +24,52 @@ def unit_value(value):
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
 
 
-def install(prefix, config, binary, configure_service=False):
-    helper = prefix / "libexec/phonon-ibus-helper"
-    helper.parent.mkdir(parents=True, exist_ok=True)
-    temporary = helper.with_suffix(".new")
-    shutil.copy2(binary, temporary)
-    temporary.chmod(0o755)
-    temporary.replace(helper)
+def component_paths():
+    """Preserve daemon/unit overrides as well as distribution defaults."""
+    paths = []
+    environments = [os.environ]
+    try:
+        pid = subprocess.check_output(
+            ["systemctl", "--user", "show", IBUS_SERVICE, "-p", "MainPID", "--value"],
+            text=True, stderr=subprocess.DEVNULL).strip()
+        entries = Path(f"/proc/{int(pid)}/environ").read_bytes().decode().split("\0")
+        environments.append(dict(item.split("=", 1) for item in entries if "=" in item))
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        pass
+    try:
+        unit = subprocess.check_output(
+            ["systemctl", "--user", "show", IBUS_SERVICE, "-p", "Environment", "--value"],
+            text=True, stderr=subprocess.DEVNULL)
+        environments.append(dict(item.split("=", 1) for item in shlex.split(unit) if "=" in item))
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        pass
+    for environment in environments:
+        paths.extend(filter(None, environment.get("IBUS_COMPONENT_PATH", "").split(os.pathsep)))
+    data = os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(os.pathsep)
+    executable = shutil.which("ibus")
+    if executable:
+        data.append(str(Path(executable).resolve().parent.parent / "share"))
+    try:
+        data.append(subprocess.check_output(
+            ["pkg-config", "--variable=datadir", "ibus-1.0"],
+            text=True, stderr=subprocess.DEVNULL).strip())
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    paths.extend(str(Path(directory) / "ibus/component") for directory in data
+                 if directory and (Path(directory) / "ibus/component").is_dir())
+    # Normalise trailing slashes without resolving stable Nix profile links.
+    return list(dict.fromkeys(str(Path(path)) for path in paths))
 
-    components = prefix / "share/ibus/component"
+
+def target_directory():
+    if os.environ.get("CARGO_TARGET_DIR"):
+        return Path(os.environ["CARGO_TARGET_DIR"]).resolve()
+    if Path("/etc/NIXOS").exists():
+        return ROOT / "build/nixos/ibus-helper"
+    return ROOT / "rust/ibus-helper/target"
+
+
+def write_descriptor(helper, components):
     components.mkdir(parents=True, exist_ok=True)
     component = ET.Element("component")
     fields = {
@@ -54,9 +92,18 @@ def install(prefix, config, binary, configure_service=False):
     ET.indent(component)
     descriptor = components / "phonon.xml"
     ET.ElementTree(component).write(descriptor, encoding="utf-8", xml_declaration=True)
+    return descriptor
 
-    # IBus 1.5.32 does not search XDG_DATA_HOME/ibus/component by default.
-    search = f"/usr/share/ibus/component:{components}"
+
+def install(prefix, config, binary, configure_service=False):
+    helper = prefix / "libexec/phonon-ibus-helper"
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    temporary = helper.with_suffix(".new")
+    shutil.copy2(binary, temporary)
+    temporary.chmod(0o755)
+    temporary.replace(helper)
+    descriptor = write_descriptor(helper, prefix / "share/ibus/component")
+    search = os.pathsep.join(dict.fromkeys([*component_paths(), str(descriptor.parent)]))
     write_owned(config / f"systemd/user/{IBUS_SERVICE}.d/50-phonon.conf",
                 f"[Service]\nEnvironment={unit_value('IBUS_COMPONENT_PATH=' + search)}\n")
     if configure_service:
@@ -88,8 +135,20 @@ def main():
     parser.add_argument("--add-source", action="store_true", help="Add Phonon to GNOME's input menu, retaining other sources")
     parser.add_argument("--refresh", action="store_true", help="Restart GNOME IBus to discover the new engine; restart dictation if configured")
     parser.add_argument("--no-build", action="store_true", help="Use an already built release binary")
+    parser.add_argument("--register-only", action="store_true", help="Configure GNOME for a declaratively installed engine (NixOS); do not install a helper or IBus drop-in")
+    parser.add_argument("--descriptor", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--helper", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--uninstall", action="store_true", help="Remove this install and its GNOME source (does not remove the speech app)")
     args = parser.parse_args()
+    if args.descriptor:
+        if not args.helper:
+            parser.error("--descriptor requires --helper")
+        write_descriptor(args.helper, args.descriptor)
+        return
+    if Path("/etc/NIXOS").exists() and not args.register_only and not args.uninstall:
+        parser.error("NixOS overrides IBUS_COMPONENT_PATH in its wrapper. Install nix/module.nix, rebuild, then use --register-only --add-source --refresh. See README.md.")
+    if args.register_only and args.uninstall:
+        parser.error("Remove the declarative NixOS engine configuration to uninstall it")
     prefix = Path.home() / ".local"
     config = Path(os.getenv("XDG_CONFIG_HOME", str(Path.home() / ".config")))
     if args.uninstall:
@@ -101,19 +160,28 @@ def main():
             if path.exists() and path.read_text().startswith(MARKER):
                 path.unlink()
         print("Removed Phonon IBus installation; clipboard dictation is retained.")
-        search = "/usr/share/ibus/component"
-    else:
+        # The user directory can contain unrelated components; retain its path.
+        search = os.pathsep.join(component_paths())
+    elif not args.register_only:
+        target = target_directory()
         if not args.no_build:
             subprocess.run(["cargo", "build", "--release", "--locked", "--manifest-path",
-                            str(ROOT / "rust/ibus-helper/Cargo.toml")], check=True)
-        helper, descriptor = install(prefix, config, ROOT / "rust/ibus-helper/target/release/phonon-ibus-helper", args.configure_service)
-        search = f"/usr/share/ibus/component:{descriptor.parent}"
+                            str(ROOT / "rust/ibus-helper/Cargo.toml"), "--target-dir", str(target)], check=True)
+        helper, descriptor = install(prefix, config, target / "release/phonon-ibus-helper", args.configure_service)
+        search = os.pathsep.join(dict.fromkeys([*component_paths(), str(descriptor.parent)]))
         print(f"Installed helper: {helper}\nInput-method descriptor: {descriptor}")
     # An old user registry cache may not know to watch the new component path.
-    subprocess.run(["ibus", "write-cache"], env={**os.environ, "IBUS_COMPONENT_PATH": search}, check=True)
+    if not args.register_only:
+        subprocess.run(["ibus", "write-cache"], env={**os.environ, "IBUS_COMPONENT_PATH": search}, check=True)
+    elif args.configure_service:
+        parser.error("Use --output auto in the NixOS service; --configure-service only sets an environment default and cannot override --output clipboard")
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
     if args.refresh:
         subprocess.run(["systemctl", "--user", "restart", IBUS_SERVICE], check=True)
+    if args.register_only:
+        engines = subprocess.check_output(["ibus", "list-engine"], text=True)
+        if not any(line.strip().startswith("phonon - ") for line in engines.splitlines()):
+            raise SystemExit("Phonon is not registered by IBus. Activate nix/module.nix and log in again or use --refresh first.")
     if args.add_source and not args.uninstall:
         add_source()
     if args.refresh and (args.configure_service or args.uninstall):
@@ -121,7 +189,8 @@ def main():
     if not args.uninstall:
         print("Select Phonon Dictation (English, UK) with Super+Space or the GNOME input-source menu.")
         if not args.refresh:
-            print("Log out and back in for IBus discovery, or rerun with --no-build --refresh when idle.")
+            print("Log out and back in for IBus discovery, or rerun with "
+                  + ("--register-only" if args.register_only else "--no-build") + " --refresh when idle.")
 
 
 if __name__ == "__main__":
