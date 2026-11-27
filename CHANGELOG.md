@@ -22,6 +22,10 @@
 
 ### Fixed
 
+- Recover native Phonon input after GNOME unlock leaves the US keyboard fallback
+  active following cancelled engine switches. A background unlock watcher
+  rechecks the user's source preference and unlocked state before bounded
+  reactivation; per-window sources and clipboard-only output are excluded.
 - Discover and preserve IBus component paths instead of assuming
   `/usr/share/ibus/component`. NixOS uses its engine package mechanism because
   its wrapper replaces `IBUS_COMPONENT_PATH`; an environment-only drop-in does
@@ -47,6 +51,10 @@
 
 ### Verification
 
+- Unlock recovery: all 76 Python tests passed, and a private session-bus check
+  verified unlock-event dispatch and monitor shutdown. The user confirmed that
+  Right Ctrl dictation works after a real GNOME lock/unlock without toggling
+  input sources.
 - 67 automated Python tests cover input recovery, recording ownership, mirrored events,
   input during transcription and paste, device-cache invalidation, hotplug,
   permission retries, suspend/resume handling, native-output routing/failures,

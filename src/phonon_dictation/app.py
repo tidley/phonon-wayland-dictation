@@ -20,6 +20,7 @@ from evdev import ecodes
 
 from .keyboards import KeyboardMonitor, KeySnapshot, ResumeWatch, suspend_offset
 from . import ibus
+from .session import UnlockRecovery
 
 
 KEY_TALK = ecodes.KEY_RIGHTCTRL
@@ -267,11 +268,13 @@ def main():
     monitor = KeyboardMonitor(keyboard_state.added, device_removed)
     resume = ResumeWatch()
     stopping = threading.Event()
+    unlock_recovery = UnlockRecovery()
     worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dictation")
 
     try:
         server_proc = ensure_server(args)
         monitor.reconcile()
+        unlock_recovery.start(args.output)
         print("Ready. Right Ctrl = normal paste; Right Ctrl + Right Shift = terminal paste.", flush=True)
         while True:
             events = monitor.poll()
@@ -323,6 +326,7 @@ def main():
         print("\nStopped.", flush=True)
     finally:
         stopping.set()
+        unlock_recovery.close()
         if recording is not None:
             stop_process(recording)
         if recording_path is not None:

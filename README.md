@@ -129,6 +129,18 @@ See the [IBus guide](rust/ibus-helper/README.md) for installation details,
 focus behavior, developer tests, compatibility checks, and uninstallation.
 Native application compatibility is still being validated under [issue #2](https://github.com/tidley/phonon-wayland-dictation/issues/2).
 
+On GNOME, native/auto output also watches session unlocks. GNOME can cancel
+overlapping engine switches during password-field teardown and leave its US
+keyboard fallback active even while the indicator still shows Phonon. After
+unlock, dictation briefly waits for that transition to settle and restores
+Phonon if it remains your most-recently selected source and the fallback is
+still active. Recovery runs in the background, rechecks that the screen is
+unlocked and your source choice is unchanged, and retries at most three times.
+Per-window input-source mode is excluded because its selection cannot be
+inferred from the global preference. This uses `gdbus`, `gsettings`, and `ibus`
+from the GNOME runtime; successful recovery logs
+`Restored Phonon input after unlock`.
+
 ## NixOS Installation
 
 The integration has been built and tested on NixOS 26.05, GNOME 50.6,
