@@ -4,20 +4,11 @@ from __future__ import annotations
 import os
 import selectors
 import time
-from dataclasses import dataclass
 from glob import glob
 
 import pyudev
 from evdev import InputDevice, ecodes
-
-
-@dataclass
-class KeySnapshot:
-    """Ordered state recovery, rather than a synthetic press or release."""
-
-    held: list[int] | None
-    sec: int
-    usec: int
+from .input_state import KeySnapshot, ResumeWatch
 
 
 def suspend_offset():
@@ -31,17 +22,6 @@ def close_device(dev):
     except OSError:
         # EBADF can be the reason we are cleaning up this handle.
         pass
-
-
-class ResumeWatch:
-    def __init__(self):
-        self.offset = suspend_offset()
-
-    def resumed(self):
-        offset = suspend_offset()
-        resumed = offset - self.offset > 0.1
-        self.offset = offset
-        return resumed
 
 
 class KeyboardMonitor:

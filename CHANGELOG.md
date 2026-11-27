@@ -4,6 +4,14 @@
 
 ### Added
 
+- macOS backend using Quartz modifier monitoring and Command+V, `pbcopy`, and
+  FFmpeg AVFoundation microphone capture. Platform-specific package dependencies,
+  a Homebrew-aware installer, permission guidance, and mocked backend tests.
+  Physical macOS audio/hotkey operation remains subject to manual verification.
+- Configurable macOS trigger (`--talk-key right-option` or `PHONON_TALK_KEY`)
+  for built-in MacBook keyboards without Right Control, plus a second-Mac test
+  checklist and microphone troubleshooting.
+
 - NixOS installation with a declarative IBus engine package and graphical-login
   service using `--output auto`. Existing NixOS IBus engines are retained through
   list merging. The supplied Nix shell includes the native build/runtime
@@ -21,6 +29,9 @@
   results, duplicate requests, normal typing, rapid commits, and helper restart.
 
 ### Fixed
+
+- Use ApplicationServices (not Quartz) for macOS Accessibility permission checks,
+  with an explicit PyObjC ApplicationServices dependency.
 
 - Recover native Phonon input after GNOME unlock leaves the US keyboard fallback
   active following cancelled engine switches. A background unlock watcher

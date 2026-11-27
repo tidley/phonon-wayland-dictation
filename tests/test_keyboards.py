@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
+pytest.importorskip("evdev")
+pytest.importorskip("pyudev")
+
 from phonon_dictation import app, keyboards
 
 

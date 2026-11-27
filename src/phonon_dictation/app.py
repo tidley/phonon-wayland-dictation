@@ -16,9 +16,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from evdev import ecodes
-
-from .keyboards import KeyboardMonitor, KeySnapshot, ResumeWatch, suspend_offset
+if sys.platform == "darwin":
+    from .macos import KeyboardMonitor, ecodes
+else:
+    from evdev import ecodes
+    from .keyboards import KeyboardMonitor
+from .input_state import KeySnapshot, ResumeWatch, suspend_offset
 from . import ibus
 from .session import UnlockRecovery
 
@@ -118,11 +121,16 @@ class KeyboardState:
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
+    if sys.platform == "darwin":
+        p.add_argument("--talk-key", choices=("right-control", "right-option"),
+                       default=os.getenv("PHONON_TALK_KEY", "right-control"),
+                       help="macOS recording trigger; use right-option on built-in MacBook keyboards")
     p.add_argument("--output", choices=("clipboard", "ibus", "auto"), default=os.getenv("PHONON_OUTPUT", "clipboard"),
                    help="Text destination; auto uses IBus when Phonon is selected")
     p.add_argument("--mode", choices=KEYCODES, default=os.getenv("PHONON_PASTE_MODE", "normal"),
                    help="Fallback paste mode when Right Shift was not held (default: normal)")
-    p.add_argument("--source", default=os.getenv("PHONON_MIC", "default"), help="PulseAudio/PipeWire source name")
+    p.add_argument("--source", default=os.getenv("PHONON_MIC", "default"),
+                   help="Microphone: PulseAudio source on Linux; AVFoundation device index/name on macOS")
     p.add_argument("--api-url", default=os.getenv("PHONON_API_URL", "http://127.0.0.1:8000/v1/audio/transcriptions"))
     p.add_argument("--delay", type=float, default=0.25, help="Delay between key release and paste")
     p.add_argument("--server-command", default=os.getenv("PHONON_SERVER_COMMAND", "fermion serve phonon-2"), help="Command to start local speech server")
@@ -131,11 +139,22 @@ def parser():
 
 
 def paste(text: str, mode: str, delay: float):
+    if sys.platform == "darwin":
+        from .macos import paste as mac_paste
+        return mac_paste(text, mode, delay)
     # wl-copy supplies clipboard data; ydotool sends a paste shortcut.
     # Text is not passed as a command argument to a shell.
     subprocess.run(["wl-copy", "--type", "text/plain"], input=text + " ", text=True, check=True, timeout=5)
     time.sleep(max(0, delay))
     subprocess.run(["ydotool", "key", *KEYCODES[mode]], check=True, timeout=5)
+
+
+def recording_command(source, path):
+    backend = "avfoundation" if sys.platform == "darwin" else "pulse"
+    if sys.platform == "darwin":
+        source = ":" + ("0" if source == "default" else source)
+    return ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", backend,
+            "-i", source, "-ac", "1", "-ar", "16000", str(path)]
 
 
 def transcribe(path: Path, api_url: str):
@@ -246,6 +265,10 @@ def main():
     args = parser().parse_args()
     if args.delay < 0:
         raise SystemExit("--delay must be >= 0")
+    if sys.platform == "darwin":
+        if args.output == "ibus":
+            raise SystemExit("IBus output is Linux-only; use --output clipboard on macOS")
+        args.output = "clipboard"
     server_proc = None
     recording = None
     recording_path = None
@@ -265,17 +288,23 @@ def main():
         if keyboard_state.removed(path):
             cancel_recording(reason)
 
-    monitor = KeyboardMonitor(keyboard_state.added, device_removed)
+    if sys.platform == "darwin":
+        monitor = KeyboardMonitor(keyboard_state.added, device_removed, talk_key=args.talk_key)
+    else:
+        monitor = KeyboardMonitor(keyboard_state.added, device_removed)
     resume = ResumeWatch()
     stopping = threading.Event()
     unlock_recovery = UnlockRecovery()
     worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="dictation")
 
     try:
-        server_proc = ensure_server(args)
         monitor.reconcile()
+        server_proc = ensure_server(args)
         unlock_recovery.start(args.output)
-        print("Ready. Right Ctrl = normal paste; Right Ctrl + Right Shift = terminal paste.", flush=True)
+        trigger = args.talk_key.replace("-", " ").title() if sys.platform == "darwin" else "Right Ctrl"
+        print(f"Ready. Hold {trigger} to record; release to paste."
+              + (" macOS uses Command+V in all paste modes." if sys.platform == "darwin"
+                 else " Right Shift selects terminal paste."), flush=True)
         while True:
             events = monitor.poll()
             if resume.resumed():
@@ -300,8 +329,7 @@ def main():
                         recording_path = Path(f.name)
                     try:
                         recording = subprocess.Popen(
-                            ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-f", "pulse", "-i", args.source,
-                             "-ac", "1", "-ar", "16000", str(recording_path)],
+                            recording_command(args.source, recording_path),
                             stdin=subprocess.DEVNULL,
                         )
                     except OSError as exc:

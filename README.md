@@ -1,6 +1,6 @@
 # Phonon Wayland Dictation
 
-Offline, whole-recording push-to-talk dictation for Linux GNOME on Wayland, including Debian and NixOS. Hold a key while speaking; on release, the complete recording is transcribed by a local [Fermion Research Phonon-2](https://pypi.org/project/fermion-research/) server and inserted through IBus or pasted into the focused application.
+Offline, whole-recording push-to-talk dictation for macOS and Linux GNOME on Wayland, including Debian and NixOS. Hold a key while speaking; on release, the complete recording is transcribed by a local [Fermion Research Phonon-2](https://pypi.org/project/fermion-research/) server and pasted into the focused application (or inserted through optional IBus on Linux).
 
 The model is downloaded once from its upstream source. After that download, audio is processed locally: recordings are sent only to `127.0.0.1`, not to a hosted transcription service.
 
@@ -23,6 +23,8 @@ This release has been exercised on Debian 13 GNOME Wayland and NixOS 26.05 GNOME
 Phonon-2 and the `fermion-research` runtime are separate upstream software. Their model weights are downloaded into the Fermion/Hugging Face cache, are not included in this repository, and remain subject to their upstream terms.
 
 ## Installation
+
+For macOS, use the [macOS instructions](#macos-installation) below.
 
 For NixOS, use the [NixOS instructions](#nixos-installation) below. `install.sh`
 is the Debian installer and manages the project-local `.venv`.
@@ -49,7 +51,115 @@ rm -rf .venv
 ./install.sh
 ```
 
-## Keyboard Access And Security
+## macOS Installation
+
+The macOS backend uses Quartz for global modifier-key state and paste, FFmpeg
+AVFoundation for microphone capture, and `pbcopy` for the clipboard. Linux input
+libraries are not installed on Mac. Hardware dictation on macOS has not yet been
+validated; upstream Fermion/PyTorch wheel availability also depends on your
+Python version and Mac architecture (especially Intel Macs).
+
+Install [Homebrew](https://brew.sh), then:
+
+```bash
+brew install python@3.13 ffmpeg
+bash install_macos.sh
+.venv/bin/phonon-dictate
+```
+
+On a MacBook's built-in keyboard, run with **Right Option** instead:
+
+```bash
+.venv/bin/phonon-dictate --talk-key right-option
+```
+
+Alternatively, `./install.sh --install-system-deps` installs those Homebrew
+prerequisites explicitly and then uses the Mac installer. Use
+`--skip-model-download` to defer downloading the model. `PYTHON=/path/to/python`
+selects a different Python 3.10+ interpreter. Do not reuse a Linux virtualenv.
+The installer does not configure automatic startup; Linux systemd and IBus
+installation instructions do not apply to macOS.
+
+In **System Settings > Privacy & Security**, allow your terminal/Python:
+
+- **Input Monitoring** for the global hotkey.
+- **Accessibility** for simulated Command+V.
+- **Microphone** when macOS prompts during the first recording.
+
+Restart the terminal after granting access. Run as your regular user, not root.
+Hold **Right Control** to record and release to transcribe and paste, or
+**Right Option** when using `--talk-key right-option`. You can also set
+`PHONON_TALK_KEY=right-option` in your environment.
+Both normal and terminal modes use **Command+V**. The hotkey is not suppressed
+from the focused application. The default requires a Right Control key;
+many built-in Mac keyboards do not have one, so use the Right Option option
+on those keyboards. Option-based shortcuts remain visible to applications.
+
+To list microphones:
+
+```bash
+ffmpeg -f avfoundation -list_devices true -i ""
+.venv/bin/phonon-dictate --source 0
+```
+
+The listing command normally exits nonzero after printing devices. `--source`
+accepts an audio-device index or name; `default` selects audio device 0.
+If capture fails, check Microphone permission and choose the appropriate device.
+Clipboard text is replaced when pasting; secure input fields or applications
+that reject synthetic events may not work.
+
+Mac minis have no built-in microphone: connect a USB/Bluetooth microphone,
+headset, or a display/webcam with a microphone. MacBooks normally have a built-in
+microphone. Check **System Settings > Sound > Input**, then use the matching
+AVFoundation audio-device index above.
+
+The server may report that MLX is unavailable and fall back to CPU inference.
+This is not a startup failure; CPU inference may be slower. Model download and
+the first runtime compilation can take longer than subsequent starts. Successful
+HTTP `200` health checks and the `Ready` message mean startup completed, not that
+microphone capture or paste have been verified.
+
+macOS reads session-wide state for only the selected trigger and Right Shift, rather
+than Linux's per-keyboard events. Physical-keyboard ownership/disconnection
+detection is therefore not available: release the trigger before unplugging a
+keyboard. Interrupted recordings are discarded after sleep/wake. Verify capture,
+Unicode paste in an editor and terminal, permission denial/recovery, and sleep
+while recording on your Mac before relying on it.
+
+### Testing on another Mac
+
+Clone this repository (or `git pull --ff-only` in an existing checkout), then
+run the Mac installer above to create that machine's own `.venv`. After updates,
+rerun the installer or `.venv/bin/python -m pip install .`; pulling source alone
+does not update a non-editable installed copy. Run from the project directory,
+not your home directory.
+
+1. Grant the three permissions above to the terminal app actually being used;
+   fully quit/reopen it after permission changes.
+2. List microphones and select a valid audio device. On a MacBook, start with
+   `.venv/bin/phonon-dictate --talk-key right-option --source 0`, adjusting the
+   microphone index as needed.
+3. Focus a scratch text editor, hold the trigger, speak, and release. Confirm
+   `Recording...`, `Transcription complete`, and one pasted sentence.
+4. Repeat in a terminal with harmless text (do not press Return), including
+   Unicode and repeated short recordings.
+5. Check sleep/wake during recording discards interrupted capture, and a fresh
+   recording works afterward. Quit with Ctrl+C and confirm a restart works.
+
+Current manual verification: local server startup and its CPU fallback were
+observed on a Mac mini. End-to-end microphone recording, physical hotkey use,
+paste, and sleep/wake have **not** yet been verified on macOS.
+
+For automated checks (no microphone or desktop permission required):
+
+```bash
+.venv/bin/python -m pip install -e '.[test]'
+PYTHONPATH=src .venv/bin/python -m pytest -q
+```
+
+Linux-specific evdev tests are skipped on macOS.
+
+## Keyboard Access And Security (Linux)
 
 `python-evdev` reads `/dev/input/event*`. A normal Debian solution is:
 

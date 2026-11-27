@@ -37,6 +37,7 @@ def test_repeated_right_ctrl_press_does_not_start_duplicate_recording():
 
 
 def test_paste_uses_expected_clipboard_and_shortcut(monkeypatch):
+    monkeypatch.setattr(app.sys, "platform", "linux")
     calls = []
     monkeypatch.setattr(app.time, "sleep", lambda delay: calls.append(("sleep", delay)))
     monkeypatch.setattr(app.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))

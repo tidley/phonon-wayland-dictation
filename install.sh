@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$(uname -s)" == Darwin ]]; then
+  exec bash "$(dirname "$0")/install_macos.sh" "$@"
+fi
+
 usage() {
   cat <<'EOF'
 Usage: ./install.sh [--autostart] [--force-service] [--install-system-deps] [--skip-model-download]
